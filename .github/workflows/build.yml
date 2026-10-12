@@ -20,10 +20,11 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
         with:
-          accept-android-sdk-licenses: true
+          packages: ''
 
-      - name: Install required SDK packages
+      - name: Accept licenses and install packages
         run: |
+          yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install "platforms;android-34"
           sdkmanager --install "build-tools;34.0.0"
           sdkmanager --install "ndk;26.1.10909125"
