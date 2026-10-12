@@ -62,10 +62,12 @@ class SshVpnService : VpnService() {
 
     private fun runTunnel(cfg: SshConfig) {
         VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
+        var stage = "SSH connection"
         try {
             val s = connectSsh(cfg)
             session = s
 
+            stage = "Starting local SOCKS5 proxy"
             val server = Socks5Server { session }
             server.start()
             socks = server
@@ -87,6 +89,7 @@ class SshVpnService : VpnService() {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
             }
+            stage = "Creating Android VPN interface"
             val pfd = builder.establish() ?: throw IllegalStateException("VPN permission denied")
             tun = pfd
 
@@ -118,6 +121,7 @@ class SshVpnService : VpnService() {
                   log-level: warn
                 """.trimIndent() + "\n"
             )
+            stage = "Starting traffic tunnel (hev-socks5-tunnel)"
             if (!TProxyService.TProxyStartService(conf.absolutePath, pfd.fd)) {
                 throw IllegalStateException("Failed to start tunnel")
             }
@@ -135,7 +139,7 @@ class SshVpnService : VpnService() {
         } catch (e: InterruptedException) {
             // shutting down
         } catch (e: Exception) {
-            shutdown(describe(e), Status.ERROR)
+            shutdown("$stage failed: ${describe(e)}", Status.ERROR)
         }
     }
 
@@ -158,7 +162,10 @@ class SshVpnService : VpnService() {
         s.setSocketFactory(object : SocketFactory {
             override fun createSocket(host: String, port: Int): Socket {
                 val sock = Socket()
-                protect(sock)
+                if (!protect(sock)) {
+                    sock.close()
+                    throw IllegalStateException("Android VPN could not protect the SSH socket from the tunnel")
+                }
                 sock.tcpNoDelay = true
                 sock.connect(InetSocketAddress(host, port), 15000)
                 return sock
@@ -172,13 +179,19 @@ class SshVpnService : VpnService() {
     }
 
     private fun describe(e: Exception): String {
-        val m = e.message ?: e.javaClass.simpleName
+        // Include nested causes: JSch and Android socket errors often wrap the useful message.
+        val messages = generateSequence<Throwable>(e) { it.cause }
+            .mapNotNull { it.message?.takeIf(String::isNotBlank) }
+            .distinct()
+            .toList()
+        val m = messages.joinToString(" | ").ifBlank { e.javaClass.simpleName }
         return when {
-            m.contains("Auth fail", true) -> "Auth failed (wrong user/pass/key)"
-            m.contains("timeout", true) || m.contains("timed out", true) -> "Connection timed out"
-            m.contains("refused", true) -> "Connection refused (check host/port)"
-            m.contains("UnknownHost", true) || m.contains("Unable to resolve", true) -> "Host not found"
-            else -> m
+            m.contains("Auth fail", true) || m.contains("authentication failed", true) -> "SSH authentication failed; verify the username, password, or private key. Details: $m"
+            m.contains("timeout", true) || m.contains("timed out", true) -> "SSH connection timed out; verify host, port, network, and server access. Details: $m"
+            m.contains("refused", true) -> "SSH connection refused; verify host and port. Details: $m"
+            m.contains("UnknownHost", true) || m.contains("Unable to resolve", true) || m.contains("unresolved", true) -> "Server hostname could not be resolved. Details: $m"
+            m.contains("no matching", true) || m.contains("algorithm", true) || m.contains("key exchange", true) -> "SSH algorithm negotiation failed; server and client may not share compatible algorithms. Details: $m"
+            else -> m.take(240)
         }
     }
 
