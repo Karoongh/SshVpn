@@ -25,7 +25,7 @@ class SshVpnService : VpnService() {
         const val ACTION_START = "com.example.sshvpn.START"
         const val ACTION_STOP = "com.example.sshvpn.STOP"
         const val EXTRA_CONFIG = "config"
-        private const val CHANNEL_ID = "sshvpn"
+        private const val CHANNEL_ID = "karoon_vpn"
         private const val NOTIF_ID = 1
         private const val MTU = 1500
     }
@@ -41,18 +41,18 @@ class SshVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_STOP -> {
-                shutdown("قطع شد", Status.DISCONNECTED)
+                shutdown("Disconnected", Status.DISCONNECTED)
                 return START_NOT_STICKY
             }
             ACTION_START -> {
                 val cfg = intent.getStringExtra(EXTRA_CONFIG)?.let { SshConfig.fromJson(it) }
                 if (cfg == null) {
-                    VpnState.update(Status.ERROR, "کانفیگ نامعتبر است")
+                    VpnState.update(Status.ERROR, "Invalid config")
                     stopSelf()
                     return START_NOT_STICKY
                 }
                 if (worker?.isAlive == true) return START_NOT_STICKY
-                startForegroundCompat("در حال اتصال...")
+                startForegroundCompat("Connecting...")
                 stopping = false
                 worker = Thread { runTunnel(cfg) }.also { it.start() }
             }
@@ -61,33 +61,48 @@ class SshVpnService : VpnService() {
     }
 
     private fun runTunnel(cfg: SshConfig) {
-        VpnState.update(Status.CONNECTING, "اتصال SSH به ${cfg.host}:${cfg.port} ...")
+        VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
         try {
-            // 1) SSH session
             val s = connectSsh(cfg)
             session = s
 
-            // 2) local SOCKS5 -> SSH direct-tcpip
             val server = Socks5Server { session }
             server.start()
             socks = server
 
-            // 3) TUN interface
             val builder = Builder()
-                .setSession(cfg.name.ifBlank { cfg.host })
+                .setSession(cfg.name.ifBlank { "Karoon Tunnel" })
                 .setMtu(MTU)
                 .addAddress("198.18.0.1", 32)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("198.18.0.2")
+
+            if (cfg.transparentDns) {
+                builder.addDnsServer("198.18.0.2")
+            } else {
+                builder.addDnsServer("8.8.8.8")
+                builder.addDnsServer("1.1.1.1")
+            }
+
             try {
-                builder.addDisallowedApplication(packageName) // our own SSH socket must bypass the VPN
+                builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
             }
-            val pfd = builder.establish() ?: throw IllegalStateException("دسترسی VPN داده نشد")
+            val pfd = builder.establish() ?: throw IllegalStateException("VPN permission denied")
             tun = pfd
 
-            // 4) tun2socks
             val conf = File(filesDir, "tproxy.yml")
+            val mapDnsBlock = if (cfg.transparentDns) {
+                """
+                mapdns:
+                  address: 198.18.0.2
+                  port: 53
+                  network: 100.64.0.0
+                  netmask: 255.192.0.0
+                  cache-size: 10000
+                """.trimIndent()
+            } else {
+                ""
+            }
             conf.writeText(
                 """
                 tunnel:
@@ -97,29 +112,23 @@ class SshVpnService : VpnService() {
                   port: ${server.port}
                   address: 127.0.0.1
                   udp: 'tcp'
-                mapdns:
-                  address: 198.18.0.2
-                  port: 53
-                  network: 100.64.0.0
-                  netmask: 255.192.0.0
-                  cache-size: 10000
+                $mapDnsBlock
                 misc:
                   connect-timeout: 15000
                   log-level: warn
                 """.trimIndent() + "\n"
             )
             if (!TProxyService.TProxyStartService(conf.absolutePath, pfd.fd)) {
-                throw IllegalStateException("اجرای tun2socks ناموفق بود")
+                throw IllegalStateException("Failed to start tunnel")
             }
 
-            VpnState.update(Status.CONNECTED, "متصل به ${cfg.host}")
-            updateNotification("متصل به ${cfg.host}")
+            VpnState.update(Status.CONNECTED, "Connected to ${cfg.host}")
+            updateNotification("Connected to ${cfg.host}")
 
-            // 5) watchdog: when the SSH session drops, tear everything down
             while (!stopping) {
                 Thread.sleep(2000)
                 if (session?.isConnected != true) {
-                    shutdown("اتصال SSH قطع شد", Status.ERROR)
+                    shutdown("SSH connection lost", Status.ERROR)
                     return
                 }
             }
@@ -142,7 +151,6 @@ class SshVpnService : VpnService() {
         }
         val s = jsch.getSession(cfg.username, cfg.host, cfg.port)
         if (cfg.password.isNotEmpty()) s.setPassword(cfg.password)
-        // NOTE: host keys are not pinned (like most "tunnel" apps). See README for hardening.
         s.setConfig("StrictHostKeyChecking", "no")
         s.setConfig("PreferredAuthentications", "publickey,password,keyboard-interactive")
         s.setServerAliveInterval(15000)
@@ -166,10 +174,10 @@ class SshVpnService : VpnService() {
     private fun describe(e: Exception): String {
         val m = e.message ?: e.javaClass.simpleName
         return when {
-            m.contains("Auth fail", true) -> "نام کاربری/رمز یا کلید اشتباه است"
-            m.contains("timeout", true) || m.contains("timed out", true) -> "زمان اتصال تمام شد"
-            m.contains("refused", true) -> "اتصال رد شد (آدرس یا پورت اشتباه)"
-            m.contains("UnknownHost", true) || m.contains("Unable to resolve", true) -> "آدرس سرور پیدا نشد"
+            m.contains("Auth fail", true) -> "Auth failed (wrong user/pass/key)"
+            m.contains("timeout", true) || m.contains("timed out", true) -> "Connection timed out"
+            m.contains("refused", true) -> "Connection refused (check host/port)"
+            m.contains("UnknownHost", true) || m.contains("Unable to resolve", true) -> "Host not found"
             else -> m
         }
     }
@@ -190,11 +198,11 @@ class SshVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        shutdown("دسترسی VPN لغو شد", Status.DISCONNECTED)
+        shutdown("VPN permission revoked", Status.DISCONNECTED)
     }
 
     override fun onDestroy() {
-        if (!stopping) shutdown("قطع شد", Status.DISCONNECTED)
+        if (!stopping) shutdown("Disconnected", Status.DISCONNECTED)
         super.onDestroy()
     }
 
@@ -214,7 +222,7 @@ class SshVpnService : VpnService() {
     private fun buildNotification(text: String): Notification {
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, "SSH VPN", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(CHANNEL_ID, "Karoon Tunnel", NotificationManager.IMPORTANCE_LOW)
         )
         val open = PendingIntent.getActivity(
             this, 0, Intent(this, MainActivity::class.java),
@@ -225,11 +233,11 @@ class SshVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("SSH VPN")
+            .setContentTitle("Karoon Tunnel")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_lock)
             .setContentIntent(open)
-            .addAction(Notification.Action.Builder(null, "قطع", stop).build())
+            .addAction(Notification.Action.Builder(null, "Disconnect", stop).build())
             .setOngoing(true)
             .build()
     }
