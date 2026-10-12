@@ -12,6 +12,9 @@ data class SshConfig(
     val privateKey: String = "",
     val passphrase: String = "",
     val name: String = "",
+    val udpgwPort: Int = 7300,
+    val transparentDns: Boolean = true,
+    val protocol: String = "SSH-Direct",
 ) {
     fun toJson(): String = JSONObject().apply {
         put("host", host)
@@ -21,6 +24,9 @@ data class SshConfig(
         put("privateKey", privateKey)
         put("passphrase", passphrase)
         put("name", name)
+        put("udpgwPort", udpgwPort)
+        put("transparentDns", transparentDns)
+        put("protocol", protocol)
     }.toString()
 
     companion object {
@@ -37,6 +43,9 @@ data class SshConfig(
                 privateKey = o.optString("privateKey", o.optString("key", "")),
                 passphrase = o.optString("passphrase", ""),
                 name = o.optString("name", o.optString("remarks", "")),
+                udpgwPort = o.optInt("udpgwPort", o.optInt("udpgw", 7300)).let { if (it in 1..65535) it else 7300 },
+                transparentDns = o.optBoolean("transparentDns", o.optBoolean("dns", true)),
+                protocol = o.optString("protocol", "SSH-Direct"),
             )
         } catch (e: Exception) {
             null
@@ -45,15 +54,13 @@ data class SshConfig(
 }
 
 /**
- * Parses the common "ssh direct" config shapes:
+ * Parses common SSH config formats:
  *   ssh://user:pass@host:port#name
  *   host:port@user:pass
  *   host:port:user:pass
- *   host@user:pass         (port defaults to 22)
- *   {"host":"..","port":22,"username":"..","password":".."}
- *   key=value lines (host/port/user/pass)
- *   any of the above wrapped in base64
- * Returns null when nothing usable is found.
+ *   JSON objects
+ *   key=value lines
+ *   base64-wrapped configs
  */
 object ConfigParser {
 
@@ -89,7 +96,6 @@ object ConfigParser {
         s
     }
 
-    // user:pass@host:port#name
     private fun parseUri(rest: String): SshConfig? {
         var body = rest
         var name = ""
@@ -102,7 +108,7 @@ object ConfigParser {
         if (query >= 0) body = body.substring(0, query)
         body = body.trimEnd('/')
 
-        val at = body.lastIndexOf('@') // passwords may contain '@', hosts never do
+        val at = body.lastIndexOf('@')
         if (at < 0) return null
         val cred = body.substring(0, at)
         val hostPart = body.substring(at + 1)
@@ -125,7 +131,6 @@ object ConfigParser {
             body = body.substring(0, hash)
         }
 
-        // host:port@user:pass  or  host@user:pass
         val at = body.indexOf('@')
         if (at > 0) {
             val hostPart = body.substring(0, at)
@@ -138,7 +143,6 @@ object ConfigParser {
             return SshConfig(host = host, port = port, username = user, password = pass, name = name)
         }
 
-        // host:port:user:pass  (pass may contain ':')
         val parts = body.split(':', limit = 4)
         if (parts.size == 4) {
             val port = parts[1].toIntOrNull()
@@ -166,13 +170,17 @@ object ConfigParser {
             username = user,
             password = map["pass"] ?: map["password"] ?: "",
             name = map["name"] ?: map["remarks"] ?: "",
+            udpgwPort = map["udpgw"]?.toIntOrNull()?.takeIf { it in 1..65535 }
+                ?: map["udpgwport"]?.toIntOrNull()?.takeIf { it in 1..65535 } ?: 7300,
+            transparentDns = map["dns"]?.lowercase() !in listOf("off", "false", "0", "no"),
+            protocol = map["protocol"] ?: "SSH-Direct",
         )
     }
 
     private fun splitHostPort(s: String): Pair<String, Int>? {
         val t = s.trim()
         if (t.isEmpty()) return null
-        if (t.startsWith("[")) { // [ipv6]:port
+        if (t.startsWith("[")) {
             val end = t.indexOf(']')
             if (end < 0) return null
             val host = t.substring(1, end)
