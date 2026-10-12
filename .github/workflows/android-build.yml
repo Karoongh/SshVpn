@@ -35,8 +35,6 @@ jobs:
         run: ./gradlew --no-daemon :app:assembleDebug
 
       - name: Verify APK signature
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_HOME }}
         run: |
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK"
