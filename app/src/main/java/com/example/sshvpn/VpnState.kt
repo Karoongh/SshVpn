@@ -18,6 +18,11 @@ object VpnState {
     fun update(status: Status, message: String = "") {
         this.status = status
         this.message = message
+        if (message.isNotBlank()) {
+            LogStore.append("[${status.name}] $message")
+        } else {
+            LogStore.append("[${status.name}]")
+        }
         main.post { listener?.invoke() }
     }
 }
