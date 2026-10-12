@@ -68,23 +68,28 @@ class MainActivity : Activity() {
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
-        super.onCreate(savedInstancesInstanceStateFix())
+        super.onCreate(savedInstanceState)
         window.statusBarColor = BG
         profiles = ProfileStore(this)
         buildUi()
         refreshProfileSpinner()
-        profiles.getActive()?.let { fill(it.config); editingId = it.id }
+        profiles.getActive()?.let {
+            fill(it.config)
+            editingId = it.id
+        }
         VpnState.listener = { runOnUiThread { render() } }
-        LogStore.listener = { runOnUiThread { tvLogs.text = LogStore.text().ifBlank { "No logs yet." } } }
+        LogStore.listener = {
+            runOnUiThread {
+                if (::tvLogs.isInitialized) {
+                    tvLogs.text = LogStore.text().ifBlank { "No logs yet." }
+                }
+            }
+        }
         render()
-        tvLogs.text = LogStore.text().ifBlank { "No logs yet." }
+        if (::tvLogs.isInitialized) {
+            tvLogs.text = LogStore.text().ifBlank { "No logs yet." }
+        }
     }
-
-    private fun onCreateSavedInstanceStateFix(): android.os.Bundle? = null
-    private fun superOnCreate(b: android.os.Bundle?) = super.onCreate(b)
-    private fun onCreate(s: android.os.Bundle?, unused: Int) {}
-    // Keep simple onCreate above; avoid rename issues
-    private fun savedInstanceStateInstanceFix(): android.os.Bundle? = null
 
     override fun onDestroy() {
         VpnState.listener = null
@@ -114,7 +119,6 @@ class MainActivity : Activity() {
             setPadding(0, dp(2), 0, dp(12))
         })
 
-        // Status
         val statusCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = rounded(CARD, 14)
@@ -141,7 +145,6 @@ class MainActivity : Activity() {
             LinearLayout.LayoutParams.WRAP_CONTENT
         ).apply { topMargin = dp(10); bottomMargin = dp(6) })
 
-        // Top actions: Profiles / Logs
         root.addView(row(
             smallBtn("Save Profile") { saveCurrentProfile() },
             smallBtn("Delete") { deleteCurrentProfile() },
@@ -154,7 +157,6 @@ class MainActivity : Activity() {
             visibility = View.GONE
         }
 
-        // --- Home content ---
         homePanel.addView(section("Profiles"))
         spProfile = Spinner(this).apply {
             setBackgroundColor(INPUT_BG)
@@ -219,7 +221,6 @@ class MainActivity : Activity() {
         homePanel.addView(smallBtn("Select Key File") { pickFile(REQ_KEY_FILE) })
         homePanel.addView(etPassphrase)
 
-        // --- Logs panel ---
         logsPanel.addView(section("Connection Logs"))
         tvLogs = TextView(this).apply {
             textSize = 12f
@@ -294,7 +295,10 @@ class MainActivity : Activity() {
     }
 
     private fun deleteCurrentProfile() {
-        val id = editingId ?: return toast("No profile selected")
+        val id = editingId ?: run {
+            toast("No profile selected")
+            return
+        }
         profiles.delete(id)
         editingId = profiles.getActive()?.id
         profiles.getActive()?.let { fill(it.config) } ?: clearFields()
@@ -488,7 +492,6 @@ class MainActivity : Activity() {
             toast("Please fill host, port, username and password (or key)")
             return
         }
-        // auto-save as profile
         val id = editingId ?: ProfileStore.newId()
         profiles.save(Profile(id, cfg))
         editingId = id
