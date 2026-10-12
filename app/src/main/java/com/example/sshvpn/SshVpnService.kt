@@ -61,17 +61,11 @@ class SshVpnService : VpnService() {
     }
 
     private fun runTunnel(cfg: SshConfig) {
-        VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
-        var stage = "SSH connection"
+        VpnState.update(Status.CONNECTING, "Preparing Android VPN ...")
+        var stage = "Creating Android VPN interface"
         try {
-            val s = connectSsh(cfg)
-            session = s
-
-            stage = "Starting local SOCKS5 proxy"
-            val server = Socks5Server { session }
-            server.start()
-            socks = server
-
+            // Establish the VPN before creating the SSH socket. Android's protect()
+            // can return false when called before the VPN service has an established interface.
             val builder = Builder()
                 .setSession(cfg.name.ifBlank { "Karoon Tunnel" })
                 .setMtu(MTU)
@@ -89,9 +83,18 @@ class SshVpnService : VpnService() {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
             }
-            stage = "Creating Android VPN interface"
             val pfd = builder.establish() ?: throw IllegalStateException("VPN permission denied")
             tun = pfd
+
+            stage = "SSH connection"
+            VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
+            val s = connectSsh(cfg)
+            session = s
+
+            stage = "Starting local SOCKS5 proxy"
+            val server = Socks5Server { session }
+            server.start()
+            socks = server
 
             val conf = File(filesDir, "tproxy.yml")
             val mapDnsBlock = if (cfg.transparentDns) {
