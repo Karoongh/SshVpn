@@ -11,10 +11,10 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
+import com.jcraft.jsch.UIKeyboardInteractive
+import com.jcraft.jsch.UserInfo
 import hev.htproxy.TProxyService
 import java.io.File
-import java.net.InetSocketAddress
-import java.net.Socket
 
 class SshVpnService : VpnService() {
 
@@ -57,14 +57,6 @@ class SshVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
-    /**
-     * Reliable order for SSH-based VPNs on Android:
-     * 1) Connect SSH first (while no VPN is active) so the session socket
-     *    is outside the tunnel and does not need protect().
-     * 2) Start local SOCKS over that session.
-     * 3) Establish the VPN interface.
-     * 4) Hand the TUN fd to hev-socks5-tunnel.
-     */
     private fun runTunnel(cfg: SshConfig) {
         var stage = "SSH connection"
         try {
@@ -96,7 +88,6 @@ class SshVpnService : VpnService() {
                 builder.addDnsServer("1.1.1.1")
             }
 
-            // Keep this app's traffic (SSH keepalive etc.) off the VPN when possible.
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
@@ -161,7 +152,10 @@ class SshVpnService : VpnService() {
         }
     }
 
-    /** SSH is opened before the VPN interface exists — no protect() needed. */
+    /**
+     * Supports publickey, password, and keyboard-interactive.
+     * For keyboard-interactive the same password field is sent when the server prompts.
+     */
     private fun connectSsh(cfg: SshConfig): Session {
         val jsch = JSch()
         if (cfg.privateKey.isNotBlank()) {
@@ -174,11 +168,38 @@ class SshVpnService : VpnService() {
         }
         val s = jsch.getSession(cfg.username, cfg.host, cfg.port)
         if (cfg.password.isNotEmpty()) s.setPassword(cfg.password)
+
+        // Answer keyboard-interactive prompts with the stored password (typical for password prompts).
+        s.setUserInfo(object : UserInfo, UIKeyboardInteractive {
+            override fun getPassphrase(): String = cfg.passphrase
+            override fun getPassword(): String = cfg.password
+            override fun promptPassword(message: String?): Boolean = cfg.password.isNotEmpty()
+            override fun promptPassphrase(message: String?): Boolean = true
+            override fun promptYesNo(message: String?): Boolean = true
+            override fun showMessage(message: String?) {
+                if (!message.isNullOrBlank()) LogStore.append("SSH: $message")
+            }
+
+            override fun promptKeyboardInteractive(
+                destination: String?,
+                name: String?,
+                instruction: String?,
+                prompt: Array<out String>?,
+                echo: BooleanArray?,
+            ): Array<String>? {
+                LogStore.append(
+                    "keyboard-interactive prompt: ${prompt?.joinToString() ?: "(none)"}"
+                )
+                if (prompt.isNullOrEmpty()) return emptyArray()
+                // Most servers ask only for password; fill every prompt with the same password.
+                return Array(prompt.size) { cfg.password }
+            }
+        })
+
         s.setConfig("StrictHostKeyChecking", "no")
-        s.setConfig("PreferredAuthentications", "publickey,password,keyboard-interactive")
+        s.setConfig("PreferredAuthentications", "publickey,keyboard-interactive,password")
         s.setServerAliveInterval(15000)
         s.setServerAliveCountMax(3)
-        // Plain socket: VPN is not active yet, so traffic goes over the normal network.
         s.connect(20000)
         return s
     }
