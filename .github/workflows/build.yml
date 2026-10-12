@@ -17,20 +17,23 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          accept-android-sdk-licenses: true
 
-      - name: Install NDK and CMake
+      - name: Install required SDK packages
         run: |
+          sdkmanager --install "platforms;android-34"
+          sdkmanager --install "build-tools;34.0.0"
           sdkmanager --install "ndk;26.1.10909125"
           sdkmanager --install "cmake;3.22.1"
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Generate Gradle Wrapper
-        run: |
-          gradle wrapper --gradle-version 8.7
+        run: gradle wrapper --gradle-version 8.7
 
       - name: Grant execute permission
         run: chmod +x gradlew
