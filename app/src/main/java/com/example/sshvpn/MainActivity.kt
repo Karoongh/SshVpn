@@ -5,6 +5,9 @@ import android.app.Activity
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.net.VpnService
 import android.os.Build
@@ -12,9 +15,12 @@ import android.text.InputType
 import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
+import android.widget.Spinner
+import android.widget.ArrayAdapter
 import android.widget.TextView
 import android.widget.Toast
 
@@ -25,8 +31,20 @@ class MainActivity : Activity() {
         const val REQ_CONFIG_FILE = 2
         const val REQ_KEY_FILE = 3
         const val REQ_NOTIF = 4
-        const val PREFS = "ssh_vpn"
+        const val PREFS = "karoon_vpn"
         const val PREF_CONFIG = "config"
+
+        // Colors
+        val BG = Color.parseColor("#0F172A")
+        val CARD = Color.parseColor("#1E293B")
+        val ACCENT = Color.parseColor("#3B82F6")
+        val ACCENT_DARK = Color.parseColor("#2563EB")
+        val TEXT = Color.parseColor("#F1F5F9")
+        val MUTED = Color.parseColor("#94A3B8")
+        val SUCCESS = Color.parseColor("#22C55E")
+        val ERROR = Color.parseColor("#EF4444")
+        val WARNING = Color.parseColor("#F59E0B")
+        val INPUT_BG = Color.parseColor("#334155")
     }
 
     private lateinit var etLink: EditText
@@ -37,6 +55,9 @@ class MainActivity : Activity() {
     private lateinit var etPass: EditText
     private lateinit var etKey: EditText
     private lateinit var etPassphrase: EditText
+    private lateinit var etUdpgw: EditText
+    private lateinit var cbDns: CheckBox
+    private lateinit var spProtocol: Spinner
     private lateinit var tvStatus: TextView
     private lateinit var btnConnect: Button
 
@@ -44,9 +65,10 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: android.os.Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = BG
         buildUi()
         loadSaved()
-        VpnState.listener = { render() }
+        VpnState.listener = { runOnUiThread { render() } }
         render()
     }
 
@@ -60,66 +82,157 @@ class MainActivity : Activity() {
     private fun buildUi() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(16), dp(16), dp(24))
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
+            setBackgroundColor(BG)
+            setPadding(dp(20), dp(24), dp(20), dp(32))
         }
 
+        // Header
         root.addView(TextView(this).apply {
-            text = "SSH VPN"
-            textSize = 24f
+            text = "Karoon Tunnel"
+            textSize = 28f
+            setTextColor(TEXT)
+            typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
         })
-
-        tvStatus = TextView(this).apply {
-            textSize = 16f
+        root.addView(TextView(this).apply {
+            text = "Secure SSH VPN"
+            textSize = 13f
+            setTextColor(MUTED)
             gravity = Gravity.CENTER
-            setPadding(0, dp(8), 0, dp(8))
+            setPadding(0, dp(2), 0, dp(16))
+        })
+
+        // Status card
+        val statusCard = card()
+        tvStatus = TextView(this).apply {
+            textSize = 15f
+            setTextColor(TEXT)
+            gravity = Gravity.CENTER
+            setPadding(dp(12), dp(14), dp(12), dp(14))
         }
-        root.addView(tvStatus)
+        statusCard.addView(tvStatus)
+        root.addView(statusCard)
 
-        btnConnect = Button(this).apply { setOnClickListener { onConnectClicked() } }
-        root.addView(btnConnect)
+        // Connect button
+        btnConnect = Button(this).apply {
+            textSize = 16f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            background = rounded(ACCENT, 14)
+            setPadding(0, dp(16), 0, dp(16))
+            setOnClickListener { onConnectClicked() }
+        }
+        val btnLp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(12); bottomMargin = dp(8) }
+        root.addView(btnConnect, btnLp)
 
-        root.addView(section("وارد کردن کانفیگ"))
-        etLink = edit("لینک یا کانفیگ (ssh://user:pass@host:22 ، host:22@user:pass ، JSON)", multiline = true)
+        // Import section
+        root.addView(section("Import Config"))
+        etLink = field("Paste link or config (ssh://user:pass@host:port)", multiline = true)
         root.addView(etLink)
         root.addView(row(
-            button("از کلیپ‌بورد") { pasteFromClipboard() },
-            button("از فایل") { pickFile(REQ_CONFIG_FILE) },
-            button("اعمال") { applyLink() },
+            smallBtn("Clipboard") { pasteFromClipboard() },
+            smallBtn("File") { pickFile(REQ_CONFIG_FILE) },
+            smallBtn("Apply") { applyLink() },
         ))
 
-        root.addView(section("مشخصات سرور"))
-        etName = edit("نام (اختیاری)")
-        etHost = edit("آدرس سرور (host)", ltr = true, type = InputType.TYPE_TEXT_VARIATION_URI)
-        etPort = edit("پورت", ltr = true, type = InputType.TYPE_CLASS_NUMBER).apply { setText("22") }
-        etUser = edit("نام کاربری", ltr = true)
-        etPass = edit("رمز عبور", ltr = true, type = InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        // Server section
+        root.addView(section("Server"))
+        etName = field("Profile name (optional)")
+        etHost = field("Server address (host)", ltr = true, type = InputType.TYPE_TEXT_VARIATION_URI)
+        etPort = field("SSH Port", ltr = true, type = InputType.TYPE_CLASS_NUMBER).apply { setText("22") }
+        etUser = field("Username", ltr = true)
+        etPass = field("Password", ltr = true, type = InputType.TYPE_TEXT_VARIATION_PASSWORD)
         listOf(etName, etHost, etPort, etUser, etPass).forEach { root.addView(it) }
 
-        root.addView(section("کلید خصوصی (اختیاری)"))
-        etKey = edit("متن کلید خصوصی (PEM / OpenSSH)", ltr = true, multiline = true)
-        etPassphrase = edit("رمز کلید (اگر دارد)", ltr = true, type = InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        // Advanced section
+        root.addView(section("Advanced"))
+        etUdpgw = field("UDPGW Port", ltr = true, type = InputType.TYPE_CLASS_NUMBER).apply { setText("7300") }
+        root.addView(etUdpgw)
+
+        // Protocol spinner
+        root.addView(label("Protocol"))
+        spProtocol = Spinner(this).apply {
+            adapter = ArrayAdapter(
+                this@MainActivity,
+                android.R.layout.simple_spinner_dropdown_item,
+                listOf("SSH-Direct", "SSH-SSL", "SSH-WS", "SSH-Payload")
+            )
+            setBackgroundColor(INPUT_BG)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+        }
+        root.addView(spProtocol)
+
+        cbDns = CheckBox(this).apply {
+            text = "Transparent DNS"
+            setTextColor(TEXT)
+            isChecked = true
+            setPadding(0, dp(8), 0, dp(4))
+        }
+        root.addView(cbDns)
+
+        // Private key section
+        root.addView(section("Private Key (optional)"))
+        etKey = field("Private key (PEM / OpenSSH)", ltr = true, multiline = true)
+        etPassphrase = field("Key passphrase (if any)", ltr = true, type = InputType.TYPE_TEXT_VARIATION_PASSWORD)
         root.addView(etKey)
-        root.addView(button("انتخاب فایل کلید") { pickFile(REQ_KEY_FILE) })
+        root.addView(smallBtn("Select Key File") { pickFile(REQ_KEY_FILE) })
         root.addView(etPassphrase)
 
-        setContentView(ScrollView(this).apply { addView(root) })
+        // Footer
+        root.addView(TextView(this).apply {
+            text = "Karoon Tunnel  ·  v1.0"
+            textSize = 11f
+            setTextColor(MUTED)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(24), 0, 0)
+        })
+
+        setContentView(ScrollView(this).apply {
+            setBackgroundColor(BG)
+            addView(root)
+        })
+    }
+
+    private fun card() = LinearLayout(this).apply {
+        orientation = LinearLayout.VERTICAL
+        background = rounded(CARD, 16)
+        val lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        )
+        layoutParams = lp
     }
 
     private fun section(title: String) = TextView(this).apply {
         text = title
-        textSize = 16f
-        setPadding(0, dp(18), 0, dp(4))
+        textSize = 14f
+        setTextColor(ACCENT)
+        typeface = Typeface.DEFAULT_BOLD
+        setPadding(0, dp(20), 0, dp(8))
     }
 
-    private fun edit(
+    private fun label(title: String) = TextView(this).apply {
+        text = title
+        textSize = 12f
+        setTextColor(MUTED)
+        setPadding(0, dp(8), 0, dp(4))
+    }
+
+    private fun field(
         hintText: String,
         ltr: Boolean = false,
         multiline: Boolean = false,
         type: Int = InputType.TYPE_CLASS_TEXT,
     ) = EditText(this).apply {
         hint = hintText
+        setHintTextColor(MUTED)
+        setTextColor(TEXT)
+        textSize = 14f
+        background = rounded(INPUT_BG, 12)
+        setPadding(dp(14), dp(14), dp(14), dp(14))
         inputType = if (multiline) InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_MULTI_LINE else type
         if (multiline) {
             minLines = 3
@@ -129,42 +242,66 @@ class MainActivity : Activity() {
             textDirection = View.TEXT_DIRECTION_LTR
             textAlignment = View.TEXT_ALIGNMENT_VIEW_START
         }
+        val lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(8) }
+        layoutParams = lp
     }
 
-    private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
+    private fun smallBtn(label: String, onClick: () -> Unit) = Button(this).apply {
         text = label
+        textSize = 12f
+        setTextColor(TEXT)
+        background = rounded(INPUT_BG, 10)
         setOnClickListener { onClick() }
     }
 
     private fun row(vararg views: View) = LinearLayout(this).apply {
         orientation = LinearLayout.HORIZONTAL
         views.forEach { v ->
-            addView(v, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+            addView(v, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6)
+            })
         }
+        val lp = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT
+        ).apply { bottomMargin = dp(4) }
+        layoutParams = lp
+    }
+
+    private fun rounded(color: Int, radiusDp: Int) = GradientDrawable().apply {
+        setColor(color)
+        cornerRadius = dp(radiusDp).toFloat()
     }
 
     private fun render() {
         val st = VpnState.status
-        val label = when (st) {
-            Status.DISCONNECTED -> "قطع"
-            Status.CONNECTING -> "در حال اتصال..."
-            Status.CONNECTED -> "متصل"
-            Status.ERROR -> "خطا"
+        val (label, color) = when (st) {
+            Status.DISCONNECTED -> "Disconnected" to MUTED
+            Status.CONNECTING -> "Connecting..." to WARNING
+            Status.CONNECTED -> "Connected" to SUCCESS
+            Status.ERROR -> "Error" to ERROR
         }
+        tvStatus.setTextColor(color)
         tvStatus.text = if (VpnState.message.isBlank()) label else "$label\n${VpnState.message}"
-        btnConnect.text = if (st == Status.CONNECTED || st == Status.CONNECTING) "قطع اتصال" else "اتصال"
+        btnConnect.text = if (st == Status.CONNECTED || st == Status.CONNECTING) "Disconnect" else "Connect"
+        btnConnect.background = rounded(
+            if (st == Status.CONNECTED || st == Status.CONNECTING) ERROR else ACCENT, 14
+        )
     }
 
-    // ---------------------------------------------------------------- config handling
+    // ---------------------------------------------------------------- config
 
     private fun applyLink() {
         val cfg = ConfigParser.parse(etLink.text.toString())
         if (cfg == null) {
-            toast("کانفیگ قابل تشخیص نیست")
+            toast("Could not parse config")
             return
         }
         fill(cfg)
-        toast("کانفیگ اعمال شد")
+        toast("Config applied")
     }
 
     private fun fill(c: SshConfig) {
@@ -175,6 +312,11 @@ class MainActivity : Activity() {
         etPass.setText(c.password)
         if (c.privateKey.isNotBlank()) etKey.setText(c.privateKey)
         if (c.passphrase.isNotBlank()) etPassphrase.setText(c.passphrase)
+        etUdpgw.setText(c.udpgwPort.toString())
+        cbDns.isChecked = c.transparentDns
+        val protocols = listOf("SSH-Direct", "SSH-SSL", "SSH-WS", "SSH-Payload")
+        val idx = protocols.indexOf(c.protocol).takeIf { it >= 0 } ?: 0
+        spProtocol.setSelection(idx)
     }
 
     private fun readFields(): SshConfig? {
@@ -185,6 +327,7 @@ class MainActivity : Activity() {
         val pass = etPass.text.toString()
         val key = etKey.text.toString()
         if (pass.isEmpty() && key.isBlank()) return null
+        val udpgw = etUdpgw.text.toString().trim().toIntOrNull()?.takeIf { it in 1..65535 } ?: 7300
         return SshConfig(
             host = host,
             port = port,
@@ -193,6 +336,9 @@ class MainActivity : Activity() {
             privateKey = key,
             passphrase = etPassphrase.text.toString(),
             name = etName.text.toString().trim(),
+            udpgwPort = udpgw,
+            transparentDns = cbDns.isChecked,
+            protocol = spProtocol.selectedItem?.toString() ?: "SSH-Direct",
         )
     }
 
@@ -210,7 +356,7 @@ class MainActivity : Activity() {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val text = cm.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(this)?.toString()
         if (text.isNullOrBlank()) {
-            toast("کلیپ‌بورد خالی است")
+            toast("Clipboard is empty")
             return
         }
         etLink.setText(text)
@@ -231,7 +377,7 @@ class MainActivity : Activity() {
         null
     }
 
-    // ---------------------------------------------------------------- connect / disconnect
+    // ---------------------------------------------------------------- connect
 
     private fun onConnectClicked() {
         val st = VpnState.status
@@ -240,12 +386,11 @@ class MainActivity : Activity() {
             return
         }
 
-        // If a link is pasted but not applied yet, apply it first.
         if (etHost.text.isBlank() && etLink.text.isNotBlank()) applyLink()
 
         val cfg = readFields()
         if (cfg == null) {
-            toast("آدرس، پورت، نام کاربری و رمز (یا کلید) را کامل کنید")
+            toast("Please fill host, port, username and password (or key)")
             return
         }
         save(cfg)
@@ -278,12 +423,12 @@ class MainActivity : Activity() {
             REQ_VPN -> if (resultCode == RESULT_OK) {
                 readFields()?.let { startTunnel(it) }
             } else {
-                toast("اجازه VPN داده نشد")
+                toast("VPN permission denied")
             }
             REQ_CONFIG_FILE -> if (resultCode == RESULT_OK) {
                 data?.data?.let { uri ->
                     val text = readUri(uri)
-                    if (text == null) toast("خواندن فایل ناموفق بود") else {
+                    if (text == null) toast("Failed to read file") else {
                         etLink.setText(text)
                         applyLink()
                     }
@@ -292,7 +437,7 @@ class MainActivity : Activity() {
             REQ_KEY_FILE -> if (resultCode == RESULT_OK) {
                 data?.data?.let { uri ->
                     val text = readUri(uri)
-                    if (text == null) toast("خواندن فایل ناموفق بود") else etKey.setText(text)
+                    if (text == null) toast("Failed to read file") else etKey.setText(text)
                 }
             }
         }
