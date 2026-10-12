@@ -11,11 +11,8 @@ import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
-import com.jcraft.jsch.SocketFactory
 import hev.htproxy.TProxyService
 import java.io.File
-import java.io.InputStream
-import java.io.OutputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 
@@ -60,12 +57,32 @@ class SshVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
+    /**
+     * Reliable order for SSH-based VPNs on Android:
+     * 1) Connect SSH first (while no VPN is active) so the session socket
+     *    is outside the tunnel and does not need protect().
+     * 2) Start local SOCKS over that session.
+     * 3) Establish the VPN interface.
+     * 4) Hand the TUN fd to hev-socks5-tunnel.
+     */
     private fun runTunnel(cfg: SshConfig) {
-        VpnState.update(Status.CONNECTING, "Preparing Android VPN ...")
-        var stage = "Creating Android VPN interface"
+        var stage = "SSH connection"
         try {
-            // Establish the VPN before creating the SSH socket. Android's protect()
-            // can return false when called before the VPN service has an established interface.
+            VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
+            LogStore.append("Connecting SSH (before VPN) to ${cfg.host}:${cfg.port}")
+            val s = connectSsh(cfg)
+            session = s
+            LogStore.append("SSH session established")
+
+            stage = "Starting local SOCKS5 proxy"
+            VpnState.update(Status.CONNECTING, "Starting local proxy ...")
+            val server = Socks5Server { session }
+            server.start()
+            socks = server
+            LogStore.append("Local SOCKS5 on port ${server.port}")
+
+            stage = "Creating Android VPN interface"
+            VpnState.update(Status.CONNECTING, "Starting Android VPN ...")
             val builder = Builder()
                 .setSession(cfg.name.ifBlank { "Karoon Tunnel" })
                 .setMtu(MTU)
@@ -79,23 +96,19 @@ class SshVpnService : VpnService() {
                 builder.addDnsServer("1.1.1.1")
             }
 
+            // Keep this app's traffic (SSH keepalive etc.) off the VPN when possible.
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
             }
-            val pfd = builder.establish() ?: throw IllegalStateException("VPN permission denied")
+
+            val pfd = builder.establish()
+                ?: throw IllegalStateException("VPN permission denied or another VPN is active")
             tun = pfd
+            LogStore.append("VPN interface established")
 
-            stage = "SSH connection"
-            VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
-            val s = connectSsh(cfg)
-            session = s
-
-            stage = "Starting local SOCKS5 proxy"
-            val server = Socks5Server { session }
-            server.start()
-            socks = server
-
+            stage = "Starting traffic tunnel (hev-socks5-tunnel)"
+            VpnState.update(Status.CONNECTING, "Starting traffic tunnel ...")
             val conf = File(filesDir, "tproxy.yml")
             val mapDnsBlock = if (cfg.transparentDns) {
                 """
@@ -124,10 +137,10 @@ class SshVpnService : VpnService() {
                   log-level: warn
                 """.trimIndent() + "\n"
             )
-            stage = "Starting traffic tunnel (hev-socks5-tunnel)"
             if (!TProxyService.TProxyStartService(conf.absolutePath, pfd.fd)) {
-                throw IllegalStateException("Failed to start tunnel")
+                throw IllegalStateException("Failed to start hev-socks5-tunnel")
             }
+            LogStore.append("Tunnel started successfully")
 
             VpnState.update(Status.CONNECTED, "Connected to ${cfg.host}")
             updateNotification("Connected to ${cfg.host}")
@@ -142,10 +155,13 @@ class SshVpnService : VpnService() {
         } catch (e: InterruptedException) {
             // shutting down
         } catch (e: Exception) {
-            shutdown("$stage failed: ${describe(e)}", Status.ERROR)
+            val msg = "$stage failed: ${describe(e)}"
+            LogStore.append(msg)
+            shutdown(msg, Status.ERROR)
         }
     }
 
+    /** SSH is opened before the VPN interface exists — no protect() needed. */
     private fun connectSsh(cfg: SshConfig): Session {
         val jsch = JSch()
         if (cfg.privateKey.isNotBlank()) {
@@ -162,39 +178,31 @@ class SshVpnService : VpnService() {
         s.setConfig("PreferredAuthentications", "publickey,password,keyboard-interactive")
         s.setServerAliveInterval(15000)
         s.setServerAliveCountMax(3)
-        s.setSocketFactory(object : SocketFactory {
-            override fun createSocket(host: String, port: Int): Socket {
-                val sock = Socket()
-                if (!protect(sock)) {
-                    sock.close()
-                    throw IllegalStateException("Android VPN could not protect the SSH socket from the tunnel")
-                }
-                sock.tcpNoDelay = true
-                sock.connect(InetSocketAddress(host, port), 15000)
-                return sock
-            }
-
-            override fun getInputStream(socket: Socket): InputStream = socket.getInputStream()
-            override fun getOutputStream(socket: Socket): OutputStream = socket.getOutputStream()
-        })
+        // Plain socket: VPN is not active yet, so traffic goes over the normal network.
         s.connect(20000)
         return s
     }
 
     private fun describe(e: Exception): String {
-        // Include nested causes: JSch and Android socket errors often wrap the useful message.
         val messages = generateSequence<Throwable>(e) { it.cause }
             .mapNotNull { it.message?.takeIf(String::isNotBlank) }
             .distinct()
             .toList()
         val m = messages.joinToString(" | ").ifBlank { e.javaClass.simpleName }
         return when {
-            m.contains("Auth fail", true) || m.contains("authentication failed", true) -> "SSH authentication failed; verify the username, password, or private key. Details: $m"
-            m.contains("timeout", true) || m.contains("timed out", true) -> "SSH connection timed out; verify host, port, network, and server access. Details: $m"
-            m.contains("refused", true) -> "SSH connection refused; verify host and port. Details: $m"
-            m.contains("UnknownHost", true) || m.contains("Unable to resolve", true) || m.contains("unresolved", true) -> "Server hostname could not be resolved. Details: $m"
-            m.contains("no matching", true) || m.contains("algorithm", true) || m.contains("key exchange", true) -> "SSH algorithm negotiation failed; server and client may not share compatible algorithms. Details: $m"
-            else -> m.take(240)
+            m.contains("Auth fail", true) || m.contains("authentication failed", true) ->
+                "SSH authentication failed; check username, password, or private key. Details: $m"
+            m.contains("timeout", true) || m.contains("timed out", true) ->
+                "SSH connection timed out; check host, port, and network. Details: $m"
+            m.contains("refused", true) ->
+                "SSH connection refused; check host and port. Details: $m"
+            m.contains("UnknownHost", true) || m.contains("Unable to resolve", true) || m.contains("unresolved", true) ->
+                "Server hostname could not be resolved. Details: $m"
+            m.contains("no matching", true) || m.contains("algorithm", true) || m.contains("key exchange", true) ->
+                "SSH algorithm negotiation failed. Details: $m"
+            m.contains("another VPN", true) || m.contains("permission denied", true) ->
+                "Could not start VPN. Turn off any other active VPN and try again. Details: $m"
+            else -> m.take(280)
         }
     }
 
