@@ -481,38 +481,49 @@ class MainActivity : Activity() {
     }
 
     private fun onConnectClicked() {
-        val st = VpnState.status
-        if (st == Status.CONNECTED || st == Status.CONNECTING) {
-            startService(Intent(this, SshVpnService::class.java).setAction(SshVpnService.ACTION_STOP))
-            return
-        }
-        if (etHost.text.isBlank() && etLink.text.isNotBlank()) applyLink()
-        val cfg = readFields()
-        if (cfg == null) {
-            toast("Please fill host, port, username and password (or key)")
-            return
-        }
-        val id = editingId ?: ProfileStore.newId()
-        profiles.save(Profile(id, cfg))
-        editingId = id
-        refreshProfileSpinner()
+        try {
+            val st = VpnState.status
+            if (st == Status.CONNECTED || st == Status.CONNECTING) {
+                startService(Intent(this, SshVpnService::class.java).setAction(SshVpnService.ACTION_STOP))
+                return
+            }
+            if (etHost.text.isBlank() && etLink.text.isNotBlank()) applyLink()
+            val cfg = readFields()
+            if (cfg == null) {
+                toast("Please fill host, port, username and password (or key)")
+                return
+            }
+            val id = editingId ?: ProfileStore.newId()
+            profiles.save(Profile(id, cfg))
+            editingId = id
+            refreshProfileSpinner()
 
-        if (Build.VERSION.SDK_INT >= 33 &&
-            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
-        ) {
-            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
+            if (Build.VERSION.SDK_INT >= 33 &&
+                checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), REQ_NOTIF)
+            }
+            val prepare = VpnService.prepare(this)
+            if (prepare != null) startActivityForResult(prepare, REQ_VPN) else startTunnel(cfg)
+        } catch (e: Exception) {
+            LogStore.append("Connect click crashed: ${e.javaClass.simpleName}: ${e.message}")
+            toast("Error: ${e.message}")
         }
-        val prepare = VpnService.prepare(this)
-        if (prepare != null) startActivityForResult(prepare, REQ_VPN) else startTunnel(cfg)
     }
 
     private fun startTunnel(cfg: SshConfig) {
-        LogStore.append("Starting tunnel to ${cfg.host}:${cfg.port}")
-        startForegroundService(
-            Intent(this, SshVpnService::class.java)
-                .setAction(SshVpnService.ACTION_START)
-                .putExtra(SshVpnService.EXTRA_CONFIG, cfg.toJson())
-        )
+        try {
+            LogStore.append("Starting tunnel to ${cfg.host}:${cfg.port}")
+            startForegroundService(
+                Intent(this, SshVpnService::class.java)
+                    .setAction(SshVpnService.ACTION_START)
+                    .putExtra(SshVpnService.EXTRA_CONFIG, cfg.toJson())
+            )
+        } catch (e: Exception) {
+            LogStore.append("startForegroundService failed: ${e.javaClass.simpleName}: ${e.message}")
+            toast("Could not start service: ${e.message}")
+            VpnState.update(Status.ERROR, "Could not start service: ${e.message}")
+        }
     }
 
     @Deprecated("Deprecated in Java")
