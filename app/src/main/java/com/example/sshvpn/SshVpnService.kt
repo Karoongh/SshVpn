@@ -36,23 +36,29 @@ class SshVpnService : VpnService() {
     private var stopping = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_STOP -> {
-                shutdown("Disconnected", Status.DISCONNECTED)
-                return START_NOT_STICKY
-            }
-            ACTION_START -> {
-                val cfg = intent.getStringExtra(EXTRA_CONFIG)?.let { SshConfig.fromJson(it) }
-                if (cfg == null) {
-                    VpnState.update(Status.ERROR, "Invalid config")
-                    stopSelf()
+        try {
+            when (intent?.action) {
+                ACTION_STOP -> {
+                    shutdown("Disconnected", Status.DISCONNECTED)
                     return START_NOT_STICKY
                 }
-                if (worker?.isAlive == true) return START_NOT_STICKY
-                startForegroundCompat("Connecting...")
-                stopping = false
-                worker = Thread { runTunnel(cfg) }.also { it.start() }
+                ACTION_START -> {
+                    val cfg = intent.getStringExtra(EXTRA_CONFIG)?.let { SshConfig.fromJson(it) }
+                    if (cfg == null) {
+                        VpnState.update(Status.ERROR, "Invalid config")
+                        stopSelf()
+                        return START_NOT_STICKY
+                    }
+                    if (worker?.isAlive == true) return START_NOT_STICKY
+                    startForegroundCompat("Connecting...")
+                    stopping = false
+                    worker = Thread { runTunnel(cfg) }.also { it.start() }
+                }
             }
+        } catch (e: Exception) {
+            LogStore.append("Service start crashed: ${e.javaClass.simpleName}: ${e.message}")
+            VpnState.update(Status.ERROR, "Service error: ${e.message}")
+            stopSelf()
         }
         return START_NOT_STICKY
     }
@@ -152,10 +158,6 @@ class SshVpnService : VpnService() {
         }
     }
 
-    /**
-     * Supports publickey, password, and keyboard-interactive.
-     * For keyboard-interactive the same password field is sent when the server prompts.
-     */
     private fun connectSsh(cfg: SshConfig): Session {
         val jsch = JSch()
         if (cfg.privateKey.isNotBlank()) {
@@ -169,7 +171,6 @@ class SshVpnService : VpnService() {
         val s = jsch.getSession(cfg.username, cfg.host, cfg.port)
         if (cfg.password.isNotEmpty()) s.setPassword(cfg.password)
 
-        // Answer keyboard-interactive prompts with the stored password (typical for password prompts).
         s.setUserInfo(object : UserInfo, UIKeyboardInteractive {
             override fun getPassphrase(): String = cfg.passphrase
             override fun getPassword(): String = cfg.password
@@ -191,7 +192,6 @@ class SshVpnService : VpnService() {
                     "keyboard-interactive prompt: ${prompt?.joinToString() ?: "(none)"}"
                 )
                 if (prompt.isNullOrEmpty()) return emptyArray()
-                // Most servers ask only for password; fill every prompt with the same password.
                 return Array(prompt.size) { cfg.password }
             }
         })
@@ -238,7 +238,7 @@ class SshVpnService : VpnService() {
         try { tun?.close() } catch (_: Exception) {}
         tun = null
         VpnState.update(status, message)
-        stopForeground(STOP_FOREGROUND_REMOVE)
+        try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
         stopSelf()
     }
 
@@ -253,8 +253,11 @@ class SshVpnService : VpnService() {
 
     private fun startForegroundCompat(text: String) {
         val n = buildNotification(text)
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SYSTEM_EXEMPTED)
+        if (Build.VERSION.SDK_INT >= 34) {
+            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+        } else if (Build.VERSION.SDK_INT >= 29) {
+            @Suppress("DEPRECATION")
+            startForeground(NOTIF_ID, n, 0)
         } else {
             startForeground(NOTIF_ID, n)
         }
