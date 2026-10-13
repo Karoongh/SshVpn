@@ -11,6 +11,8 @@ object VpnState {
         private set
     @Volatile var message: String = ""
         private set
+    /** Local SOCKS5 port while tunnel is up; -1 when down. */
+    @Volatile var socksPort: Int = -1
 
     var listener: (() -> Unit)? = null
     private val main = Handler(Looper.getMainLooper())
@@ -18,6 +20,9 @@ object VpnState {
     fun update(status: Status, message: String = "") {
         this.status = status
         this.message = message
+        if (status != Status.CONNECTED && status != Status.CONNECTING) {
+            socksPort = -1
+        }
         if (message.isNotBlank()) {
             LogStore.append("[${status.name}] $message")
         } else {
