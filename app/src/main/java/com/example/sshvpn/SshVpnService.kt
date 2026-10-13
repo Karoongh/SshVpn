@@ -57,8 +57,10 @@ class SshVpnService : VpnService() {
                         try {
                             runTunnel(cfg)
                         } catch (t: Throwable) {
-                            LogStore.append("Worker crashed: ${t.javaClass.simpleName}: ${t.message}")
-                            shutdown("Worker crashed: ${t.message}", Status.ERROR)
+                            if (!stopping) {
+                                LogStore.append("Worker crashed: ${t.javaClass.simpleName}: ${t.message}")
+                                shutdown("Worker crashed: ${t.message}", Status.ERROR)
+                            }
                         }
                     }, "ssh-vpn-worker").also { it.start() }
                 }
@@ -77,6 +79,7 @@ class SshVpnService : VpnService() {
             VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
             LogStore.append("Connecting SSH (before VPN) to ${cfg.host}:${cfg.port}")
             val s = connectSsh(cfg)
+            if (stopping) return
             session = s
             LogStore.append("SSH session established")
 
@@ -152,21 +155,31 @@ class SshVpnService : VpnService() {
 
             while (!stopping) {
                 Thread.sleep(1500)
+                if (stopping) break
                 val sess = session
                 if (sess == null || !sess.isConnected) {
-                    shutdown("SSH connection lost", Status.ERROR)
+                    // Only real drops — ignore after user pressed Disconnect
+                    if (!stopping) {
+                        shutdown("SSH connection lost", Status.ERROR)
+                    }
                     return
                 }
                 try {
                     sess.sendKeepAliveMsg()
                 } catch (_: Exception) {
+                    if (!stopping && session?.isConnected != true) {
+                        shutdown("SSH connection lost", Status.ERROR)
+                        return
+                    }
                 }
             }
         } catch (e: InterruptedException) {
         } catch (t: Throwable) {
-            val msg = "$stage failed: ${describeThrowable(t)}"
-            LogStore.append(msg)
-            shutdown(msg, Status.ERROR)
+            if (!stopping) {
+                val msg = "$stage failed: ${describeThrowable(t)}"
+                LogStore.append(msg)
+                shutdown(msg, Status.ERROR)
+            }
         }
     }
 
@@ -245,6 +258,10 @@ class SshVpnService : VpnService() {
 
     @Synchronized
     private fun shutdown(message: String, status: Status) {
+        if (stopping && status == Status.ERROR) {
+            // Already shutting down intentionally — do not overwrite with ERROR
+            return
+        }
         stopping = true
         try {
             if (TProxyService.nativeReady) TProxyService.TProxyStopService()
