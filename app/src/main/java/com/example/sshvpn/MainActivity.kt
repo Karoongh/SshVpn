@@ -62,6 +62,7 @@ class MainActivity : Activity() {
     private lateinit var tvStatus: TextView
     private lateinit var tvLogs: TextView
     private lateinit var btnConnect: Button
+    private lateinit var btnDisconnect: Button
     private lateinit var logsPanel: LinearLayout
     private lateinit var homePanel: LinearLayout
 
@@ -132,7 +133,9 @@ class MainActivity : Activity() {
         statusCard.addView(tvStatus)
         root.addView(statusCard)
 
+        // Connect + Disconnect side by side (always visible)
         btnConnect = Button(this).apply {
+            text = "Connect"
             textSize = 15f
             setTextColor(Color.WHITE)
             typeface = Typeface.DEFAULT_BOLD
@@ -140,10 +143,28 @@ class MainActivity : Activity() {
             setPadding(0, dp(14), 0, dp(14))
             setOnClickListener { onConnectClicked() }
         }
-        root.addView(btnConnect, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT,
-            LinearLayout.LayoutParams.WRAP_CONTENT
-        ).apply { topMargin = dp(10); bottomMargin = dp(6) })
+        btnDisconnect = Button(this).apply {
+            text = "Disconnect"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            background = rounded(ERROR, 12)
+            setPadding(0, dp(14), 0, dp(14))
+            setOnClickListener { onDisconnectClicked() }
+        }
+        root.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(btnConnect, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginEnd = dp(6)
+            })
+            addView(btnDisconnect, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+                marginStart = dp(6)
+            })
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { topMargin = dp(10); bottomMargin = dp(6) }
+        })
 
         root.addView(row(
             smallBtn("Save Profile") { saveCurrentProfile() },
@@ -242,7 +263,7 @@ class MainActivity : Activity() {
         root.addView(logsPanel)
 
         root.addView(TextView(this).apply {
-            text = "Karoon Tunnel  ·  v1.1"
+            text = "Karoon Tunnel  ·  v1.2"
             textSize = 11f
             setTextColor(MUTED)
             gravity = Gravity.CENTER
@@ -398,10 +419,9 @@ class MainActivity : Activity() {
         }
         tvStatus.setTextColor(color)
         tvStatus.text = if (VpnState.message.isBlank()) label else "$label\n${VpnState.message}"
-        btnConnect.text = if (st == Status.CONNECTED || st == Status.CONNECTING) "Disconnect" else "Connect"
-        btnConnect.background = rounded(
-            if (st == Status.CONNECTED || st == Status.CONNECTING) ERROR else ACCENT, 12
-        )
+        val busy = st == Status.CONNECTED || st == Status.CONNECTING
+        btnConnect.isEnabled = !busy
+        btnDisconnect.isEnabled = busy || st == Status.ERROR
     }
 
     private fun applyLink() {
@@ -480,13 +500,19 @@ class MainActivity : Activity() {
         null
     }
 
+    private fun onDisconnectClicked() {
+        try {
+            LogStore.append("Disconnect requested")
+            startService(Intent(this, SshVpnService::class.java).setAction(SshVpnService.ACTION_STOP))
+            VpnState.update(Status.DISCONNECTED, "Disconnected")
+        } catch (t: Throwable) {
+            LogStore.append("Disconnect failed: ${t.message}")
+            toast("Disconnect failed: ${t.message}")
+        }
+    }
+
     private fun onConnectClicked() {
         try {
-            val st = VpnState.status
-            if (st == Status.CONNECTED || st == Status.CONNECTING) {
-                startService(Intent(this, SshVpnService::class.java).setAction(SshVpnService.ACTION_STOP))
-                return
-            }
             if (etHost.text.isBlank() && etLink.text.isNotBlank()) applyLink()
             val cfg = readFields()
             if (cfg == null) {
@@ -505,24 +531,28 @@ class MainActivity : Activity() {
             }
             val prepare = VpnService.prepare(this)
             if (prepare != null) startActivityForResult(prepare, REQ_VPN) else startTunnel(cfg)
-        } catch (e: Exception) {
-            LogStore.append("Connect click crashed: ${e.javaClass.simpleName}: ${e.message}")
-            toast("Error: ${e.message}")
+        } catch (t: Throwable) {
+            LogStore.append("Connect click crashed: ${t.javaClass.simpleName}: ${t.message}")
+            toast("Error: ${t.message}")
+            VpnState.update(Status.ERROR, "Error: ${t.message}")
         }
     }
 
     private fun startTunnel(cfg: SshConfig) {
         try {
             LogStore.append("Starting tunnel to ${cfg.host}:${cfg.port}")
-            startForegroundService(
-                Intent(this, SshVpnService::class.java)
-                    .setAction(SshVpnService.ACTION_START)
-                    .putExtra(SshVpnService.EXTRA_CONFIG, cfg.toJson())
-            )
-        } catch (e: Exception) {
-            LogStore.append("startForegroundService failed: ${e.javaClass.simpleName}: ${e.message}")
-            toast("Could not start service: ${e.message}")
-            VpnState.update(Status.ERROR, "Could not start service: ${e.message}")
+            val intent = Intent(this, SshVpnService::class.java)
+                .setAction(SshVpnService.ACTION_START)
+                .putExtra(SshVpnService.EXTRA_CONFIG, cfg.toJson())
+            if (Build.VERSION.SDK_INT >= 26) {
+                startForegroundService(intent)
+            } else {
+                startService(intent)
+            }
+        } catch (t: Throwable) {
+            LogStore.append("start service failed: ${t.javaClass.simpleName}: ${t.message}")
+            toast("Could not start service: ${t.message}")
+            VpnState.update(Status.ERROR, "Could not start service: ${t.message}")
         }
     }
 
