@@ -9,6 +9,7 @@ import android.content.pm.ServiceInfo
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.system.OsConstants
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.Session
 import com.jcraft.jsch.UIKeyboardInteractive
@@ -24,7 +25,8 @@ class SshVpnService : VpnService() {
         const val EXTRA_CONFIG = "config"
         private const val CHANNEL_ID = "karoon_vpn"
         private const val NOTIF_ID = 1
-        private const val MTU = 1500
+        // SSH overhead: keep MTU lower than Ethernet default to avoid black-hole paths
+        private const val MTU = 1280
     }
 
     private var worker: Thread? = null
@@ -91,16 +93,20 @@ class SshVpnService : VpnService() {
             val builder = Builder()
                 .setSession(cfg.name.ifBlank { "Karoon Tunnel" })
                 .setMtu(MTU)
-                .addAddress("198.18.0.1", 32)
+                .addAddress("198.18.0.1", 30)
                 .addRoute("0.0.0.0", 0)
+                // Force apps to prefer IPv4 through the tunnel (avoid broken IPv6 hang)
+                .addDnsServer("198.18.0.2")
 
-            if (cfg.transparentDns) {
-                builder.addDnsServer("198.18.0.2")
-            } else {
-                builder.addDnsServer("8.8.8.8")
-                builder.addDnsServer("1.1.1.1")
+            try {
+                builder.allowFamily(OsConstants.AF_INET)
+            } catch (_: Exception) {
+            }
+            if (Build.VERSION.SDK_INT >= 29) {
+                try { builder.setMetered(false) } catch (_: Exception) {}
             }
 
+            // Keep this app (SSH keepalive / SOCKS) off the VPN routing table
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
@@ -109,26 +115,17 @@ class SshVpnService : VpnService() {
             val pfd = builder.establish()
                 ?: throw IllegalStateException("VPN permission denied or another VPN is active")
             tun = pfd
-            LogStore.append("VPN interface established")
+            LogStore.append("VPN interface established (MTU=$MTU)")
 
             stage = "Starting traffic tunnel (hev-socks5-tunnel)"
             VpnState.update(Status.CONNECTING, "Starting traffic tunnel ...")
             if (!TProxyService.nativeReady) {
                 throw IllegalStateException("Native library hev-socks5-tunnel failed to load on this device")
             }
+
+            // Always use mapdns so DNS queries are answered inside the tunnel and
+            // hostnames are resolved on the SSH server side via SOCKS.
             val conf = File(filesDir, "tproxy.yml")
-            val mapDnsBlock = if (cfg.transparentDns) {
-                """
-                mapdns:
-                  address: 198.18.0.2
-                  port: 53
-                  network: 100.64.0.0
-                  netmask: 255.192.0.0
-                  cache-size: 10000
-                """.trimIndent()
-            } else {
-                ""
-            }
             conf.writeText(
                 """
                 tunnel:
@@ -138,12 +135,21 @@ class SshVpnService : VpnService() {
                   port: ${server.port}
                   address: 127.0.0.1
                   udp: 'tcp'
-                $mapDnsBlock
+                mapdns:
+                  address: 198.18.0.2
+                  port: 53
+                  network: 198.18.0.0
+                  netmask: 255.255.0.0
+                  cache-size: 10000
                 misc:
+                  task-stack-size: 86016
                   connect-timeout: 15000
+                  tcp-read-write-timeout: 300000
+                  udp-read-write-timeout: 60000
                   log-level: warn
                 """.trimIndent() + "\n"
             )
+            LogStore.append("tproxy.yml written; starting hev on fd=${pfd.fd}")
             if (!TProxyService.TProxyStartService(conf.absolutePath, pfd.fd)) {
                 throw IllegalStateException("Failed to start hev-socks5-tunnel")
             }
@@ -275,7 +281,6 @@ class SshVpnService : VpnService() {
                 startForeground(NOTIF_ID, n)
             }
         } catch (t: Throwable) {
-            // Last resort: plain startForeground without type
             LogStore.append("startForeground typed failed: ${t.message}; retry plain")
             startForeground(NOTIF_ID, n)
         }
