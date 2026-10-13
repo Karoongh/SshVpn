@@ -25,7 +25,6 @@ class SshVpnService : VpnService() {
         const val EXTRA_CONFIG = "config"
         private const val CHANNEL_ID = "karoon_vpn"
         private const val NOTIF_ID = 1
-        // Balanced for SSH overhead without excessive fragmentation
         private const val MTU = 1280
     }
 
@@ -81,16 +80,14 @@ class SshVpnService : VpnService() {
             session = s
             LogStore.append("SSH session established")
 
-            // Cap concurrency for stability on shared SSH panels (max 2 sessions, limited channels)
             val channels = cfg.maxChannels.coerceIn(8, 64)
 
             stage = "Starting local SOCKS5 proxy"
             VpnState.update(Status.CONNECTING, "Starting local proxy ...")
-            // TCP-only SOCKS: stable path. Experimental UDPGW disabled in hot path
-            // because a wrong wire format made apps slow/unstable.
             val server = Socks5Server({ session }, channels, udpgw = null)
             server.start()
             socks = server
+            VpnState.socksPort = server.port
             LogStore.append("Local SOCKS5 on port ${server.port} (tcp relay, maxChannels=$channels)")
 
             stage = "Creating Android VPN interface"
@@ -126,7 +123,6 @@ class SshVpnService : VpnService() {
                 throw IllegalStateException("Native library hev-socks5-tunnel failed to load on this device")
             }
 
-            // udp:tcp = UDP (DNS etc.) carried as TCP CONNECT through SOCKS — stable over pure SSH.
             val conf = File(filesDir, "tproxy.yml")
             conf.writeText(
                 """
@@ -161,7 +157,6 @@ class SshVpnService : VpnService() {
                     shutdown("SSH connection lost", Status.ERROR)
                     return
                 }
-                // Proactively send keepalive traffic
                 try {
                     sess.sendKeepAliveMsg()
                 } catch (_: Exception) {
@@ -219,7 +214,6 @@ class SshVpnService : VpnService() {
         s.setConfig("compression.c2s", "none")
         s.setConfig("cipher.s2c", "aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com")
         s.setConfig("cipher.c2s", "aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com")
-        // Aggressive keepalive so shared panels do not drop the session
         s.setServerAliveInterval(5000)
         s.setServerAliveCountMax(6)
         s.connect(20000)
@@ -257,6 +251,7 @@ class SshVpnService : VpnService() {
         } catch (_: Throwable) {}
         try { socks?.stop() } catch (_: Exception) {}
         socks = null
+        VpnState.socksPort = -1
         try { session?.disconnect() } catch (_: Exception) {}
         session = null
         try { tun?.close() } catch (_: Exception) {}
