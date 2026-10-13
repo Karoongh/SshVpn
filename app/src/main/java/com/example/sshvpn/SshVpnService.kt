@@ -25,7 +25,6 @@ class SshVpnService : VpnService() {
         const val EXTRA_CONFIG = "config"
         private const val CHANNEL_ID = "karoon_vpn"
         private const val NOTIF_ID = 1
-        // SSH overhead: keep MTU lower than Ethernet default to avoid black-hole paths
         private const val MTU = 1280
     }
 
@@ -83,7 +82,7 @@ class SshVpnService : VpnService() {
 
             stage = "Starting local SOCKS5 proxy"
             VpnState.update(Status.CONNECTING, "Starting local proxy ...")
-            val server = Socks5Server { session }
+            val server = Socks5Server({ session }, cfg.maxChannels)
             server.start()
             socks = server
             LogStore.append("Local SOCKS5 on port ${server.port}")
@@ -95,7 +94,6 @@ class SshVpnService : VpnService() {
                 .setMtu(MTU)
                 .addAddress("198.18.0.1", 30)
                 .addRoute("0.0.0.0", 0)
-                // Force apps to prefer IPv4 through the tunnel (avoid broken IPv6 hang)
                 .addDnsServer("198.18.0.2")
 
             try {
@@ -106,7 +104,6 @@ class SshVpnService : VpnService() {
                 try { builder.setMetered(false) } catch (_: Exception) {}
             }
 
-            // Keep this app (SSH keepalive / SOCKS) off the VPN routing table
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
@@ -123,8 +120,6 @@ class SshVpnService : VpnService() {
                 throw IllegalStateException("Native library hev-socks5-tunnel failed to load on this device")
             }
 
-            // Always use mapdns so DNS queries are answered inside the tunnel and
-            // hostnames are resolved on the SSH server side via SOCKS.
             val conf = File(filesDir, "tproxy.yml")
             conf.writeText(
                 """
@@ -166,7 +161,6 @@ class SshVpnService : VpnService() {
                 }
             }
         } catch (e: InterruptedException) {
-            // shutting down
         } catch (t: Throwable) {
             val msg = "$stage failed: ${describeThrowable(t)}"
             LogStore.append(msg)
