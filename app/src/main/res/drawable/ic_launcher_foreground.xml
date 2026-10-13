@@ -5,31 +5,17 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
 
-    <!-- Outer soft ring -->
     <path
-        android:fillColor="#1E3A5F"
-        android:pathData="M54,22c17.7,0 32,14.3 32,32s-14.3,32 -32,32 -32,-14.3 -32,-32 14.3,-32 32,-32z" />
+        android:fillColor="#0EA5E9"
+        android:fillAlpha="0.35"
+        android:pathData="M54,40c10,0 18,8 18,18s-8,18 -18,18 -18,-8 -18,-18 8,-18 18,-18z" />
 
-    <!-- Tunnel arch body -->
     <path
-        android:fillColor="#3B82F6"
-        android:pathData="M54,30c13.3,0 24,10.7 24,24v20c0,2.2 -1.8,4 -4,4H34c-2.2,0 -4,-1.8 -4,-4V54c0,-13.3 10.7,-24 24,-24z" />
+        android:fillColor="#67E8F9"
+        android:pathData="M38,32h10v18.5L66,32h12L58.5,52 78,76H66L48,56.5V76H38z" />
 
-    <!-- Inner dark tunnel -->
     <path
-        android:fillColor="#0B1220"
-        android:pathData="M54,40c7.7,0 14,6.3 14,14v16H40V54c0,-7.7 6.3,-14 14,-14z" />
-
-    <!-- Light at the end of the tunnel -->
-    <path
-        android:fillColor="#E0F2FE"
-        android:pathData="M54,50c3.3,0 6,2.7 6,6v4h-12v-4c0,-3.3 2.7,-6 6,-6z" />
-
-    <!-- Small keyhole accent (security) -->
-    <path
-        android:fillColor="#60A5FA"
-        android:pathData="M54,56m-2.5,0a2.5,2.5 0,1 1,5 0a2.5,2.5 0,1 1,-5 0" />
-    <path
-        android:fillColor="#60A5FA"
-        android:pathData="M52.8,58h2.4v5c0,0.6 -0.5,1.1 -1.2,1.1h0c-0.7,0 -1.2,-0.5 -1.2,-1.1v-5z" />
+        android:fillColor="#22D3EE"
+        android:fillAlpha="0.7"
+        android:pathData="M48,50.5 L58.5,52 48,56.5z" />
 </vector>
