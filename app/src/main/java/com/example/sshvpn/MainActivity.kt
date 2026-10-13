@@ -57,6 +57,7 @@ class MainActivity : Activity() {
     private lateinit var etKey: EditText
     private lateinit var etPassphrase: EditText
     private lateinit var etUdpgw: EditText
+    private lateinit var etMaxChannels: EditText
     private lateinit var cbDns: CheckBox
     private lateinit var spProtocol: Spinner
     private lateinit var tvStatus: TextView
@@ -133,7 +134,6 @@ class MainActivity : Activity() {
         statusCard.addView(tvStatus)
         root.addView(statusCard)
 
-        // Connect + Disconnect side by side (always visible)
         btnConnect = Button(this).apply {
             text = "Connect"
             textSize = 15f
@@ -217,6 +217,8 @@ class MainActivity : Activity() {
         homePanel.addView(section("Advanced"))
         etUdpgw = field("UDPGW Port", ltr = true, type = InputType.TYPE_CLASS_NUMBER).apply { setText("7300") }
         homePanel.addView(etUdpgw)
+        etMaxChannels = field("Max channels (8-128, default 48)", ltr = true, type = InputType.TYPE_CLASS_NUMBER).apply { setText("48") }
+        homePanel.addView(etMaxChannels)
         homePanel.addView(label("Protocol"))
         spProtocol = Spinner(this).apply {
             adapter = ArrayAdapter(
@@ -263,7 +265,7 @@ class MainActivity : Activity() {
         root.addView(logsPanel)
 
         root.addView(TextView(this).apply {
-            text = "Karoon Tunnel  ·  v1.2"
+            text = "Karoon Tunnel  ·  v1.3"
             textSize = 11f
             setTextColor(MUTED)
             gravity = Gravity.CENTER
@@ -337,6 +339,7 @@ class MainActivity : Activity() {
         etKey.setText("")
         etPassphrase.setText("")
         etUdpgw.setText("7300")
+        etMaxChannels.setText("48")
         cbDns.isChecked = true
         spProtocol.setSelection(0)
     }
@@ -445,6 +448,7 @@ class MainActivity : Activity() {
         if (c.privateKey.isNotBlank()) etKey.setText(c.privateKey)
         if (c.passphrase.isNotBlank()) etPassphrase.setText(c.passphrase)
         etUdpgw.setText(c.udpgwPort.toString())
+        etMaxChannels.setText(c.maxChannels.toString())
         cbDns.isChecked = c.transparentDns
         val protocols = listOf("SSH-Direct", "SSH-SSL", "SSH-WS", "SSH-Payload")
         spProtocol.setSelection(protocols.indexOf(c.protocol).takeIf { it >= 0 } ?: 0)
@@ -459,6 +463,7 @@ class MainActivity : Activity() {
         val key = etKey.text.toString()
         if (pass.isEmpty() && key.isBlank()) return null
         val udpgw = etUdpgw.text.toString().trim().toIntOrNull()?.takeIf { it in 1..65535 } ?: 7300
+        val maxCh = etMaxChannels.text.toString().trim().toIntOrNull()?.coerceIn(8, 128) ?: 48
         return SshConfig(
             host = host,
             port = port,
@@ -470,6 +475,7 @@ class MainActivity : Activity() {
             udpgwPort = udpgw,
             transparentDns = cbDns.isChecked,
             protocol = spProtocol.selectedItem?.toString() ?: "SSH-Direct",
+            maxChannels = maxCh,
         )
     }
 
