@@ -66,6 +66,10 @@ class MainActivity : Activity() {
     private lateinit var btnDisconnect: Button
     private lateinit var logsPanel: LinearLayout
     private lateinit var homePanel: LinearLayout
+    private lateinit var testPanel: LinearLayout
+    private lateinit var tvTest: TextView
+    private lateinit var btnRunTest: Button
+    @Volatile private var testing = false
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -170,10 +174,15 @@ class MainActivity : Activity() {
             smallBtn("Save Profile") { saveCurrentProfile() },
             smallBtn("Delete") { deleteCurrentProfile() },
             smallBtn("Logs") { showLogs(true) },
+            smallBtn("Speed Test") { showTest(true) },
         ))
 
         homePanel = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         logsPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            visibility = View.GONE
+        }
+        testPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
         }
@@ -261,11 +270,47 @@ class MainActivity : Activity() {
             smallBtn("Back") { showLogs(false) },
         ))
 
+        testPanel.addView(section("Connection & Speed Test"))
+        testPanel.addView(TextView(this).apply {
+            text = "Measures latency, download and upload through the tunnel (SOCKS)."
+            textSize = 12f
+            setTextColor(MUTED)
+            setPadding(0, 0, 0, dp(8))
+        })
+        tvTest = TextView(this).apply {
+            text = "Connect first, then run the test."
+            textSize = 13f
+            setTextColor(TEXT)
+            setTextIsSelectable(true)
+            typeface = Typeface.MONOSPACE
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = rounded(CARD, 12)
+            minHeight = dp(160)
+        }
+        testPanel.addView(tvTest)
+        btnRunTest = Button(this).apply {
+            text = "Run Test"
+            textSize = 15f
+            setTextColor(Color.WHITE)
+            typeface = Typeface.DEFAULT_BOLD
+            background = rounded(ACCENT, 12)
+            setPadding(0, dp(14), 0, dp(14))
+            setOnClickListener { runSpeedTest() }
+        }
+        testPanel.addView(btnRunTest, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(10); bottomMargin = dp(6) })
+        testPanel.addView(row(
+            smallBtn("Back") { showTest(false) },
+        ))
+
         root.addView(homePanel)
         root.addView(logsPanel)
+        root.addView(testPanel)
 
         root.addView(TextView(this).apply {
-            text = "Karoon Tunnel  ·  v1.3"
+            text = "Karoon Tunnel  ·  v1.4"
             textSize = 11f
             setTextColor(MUTED)
             gravity = Gravity.CENTER
@@ -281,7 +326,64 @@ class MainActivity : Activity() {
     private fun showLogs(show: Boolean) {
         homePanel.visibility = if (show) View.GONE else View.VISIBLE
         logsPanel.visibility = if (show) View.VISIBLE else View.GONE
+        testPanel.visibility = View.GONE
         if (show) tvLogs.text = LogStore.text().ifBlank { "No logs yet." }
+    }
+
+    private fun showTest(show: Boolean) {
+        homePanel.visibility = if (show) View.GONE else View.VISIBLE
+        logsPanel.visibility = View.GONE
+        testPanel.visibility = if (show) View.VISIBLE else View.GONE
+        if (show && !testing) {
+            val port = VpnState.socksPort
+            tvTest.text = if (VpnState.status == Status.CONNECTED && port > 0) {
+                "Tunnel is up (SOCKS :$port).\nTap Run Test."
+            } else {
+                "Not connected — test will use direct network (not tunnel).\nConnect for real VPN speed."
+            }
+        }
+    }
+
+    private fun runSpeedTest() {
+        if (testing) return
+        testing = true
+        btnRunTest.isEnabled = false
+        btnRunTest.text = "Testing..."
+        val port = if (VpnState.status == Status.CONNECTED) VpnState.socksPort else -1
+        Thread {
+            val result = SpeedTest.run(port) { step ->
+                runOnUiThread { tvTest.text = "$step" }
+            }
+            runOnUiThread {
+                testing = false
+                btnRunTest.isEnabled = true
+                btnRunTest.text = "Run Test"
+                if (result.error != null) {
+                    tvTest.text = "Test failed: ${result.error}\n\nPath: ${if (result.viaProxy) "via tunnel" else "direct"}"
+                    LogStore.append("SpeedTest failed: ${result.error}")
+                } else {
+                    val path = if (result.viaProxy) "via tunnel (SOCKS)" else "direct (no VPN)"
+                    val text = buildString {
+                        appendLine("Path: $path")
+                        appendLine("Latency:  ${result.latencyMs} ms")
+                        appendLine("Download: ${result.downloadMbps} Mbps  (${result.downloadBytes / 1000} KB)")
+                        appendLine("Upload:   ${result.uploadMbps} Mbps  (${result.uploadBytes / 1000} KB)")
+                        appendLine()
+                        when {
+                            result.downloadMbps < 0 -> append("Could not measure download.")
+                            result.downloadMbps < 1 -> append("Very slow — video will struggle.")
+                            result.downloadMbps < 5 -> append("OK for chat; light video only.")
+                            result.downloadMbps < 15 -> append("Fine for 480p–720p video.")
+                            else -> append("Good throughput for HD video.")
+                        }
+                    }
+                    tvTest.text = text
+                    LogStore.append(
+                        "SpeedTest $path latency=${result.latencyMs}ms down=${result.downloadMbps}Mbps up=${result.uploadMbps}Mbps"
+                    )
+                }
+            }
+        }.start()
     }
 
     private fun copyLogs() {
