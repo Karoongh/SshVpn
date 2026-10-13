@@ -52,13 +52,20 @@ class SshVpnService : VpnService() {
                     if (worker?.isAlive == true) return START_NOT_STICKY
                     startForegroundCompat("Connecting...")
                     stopping = false
-                    worker = Thread { runTunnel(cfg) }.also { it.start() }
+                    worker = Thread({
+                        try {
+                            runTunnel(cfg)
+                        } catch (t: Throwable) {
+                            LogStore.append("Worker crashed: ${t.javaClass.simpleName}: ${t.message}")
+                            shutdown("Worker crashed: ${t.message}", Status.ERROR)
+                        }
+                    }, "ssh-vpn-worker").also { it.start() }
                 }
             }
-        } catch (e: Exception) {
-            LogStore.append("Service start crashed: ${e.javaClass.simpleName}: ${e.message}")
-            VpnState.update(Status.ERROR, "Service error: ${e.message}")
-            stopSelf()
+        } catch (t: Throwable) {
+            LogStore.append("Service start crashed: ${t.javaClass.simpleName}: ${t.message}")
+            VpnState.update(Status.ERROR, "Service error: ${t.message}")
+            try { stopSelf() } catch (_: Exception) {}
         }
         return START_NOT_STICKY
     }
@@ -106,6 +113,9 @@ class SshVpnService : VpnService() {
 
             stage = "Starting traffic tunnel (hev-socks5-tunnel)"
             VpnState.update(Status.CONNECTING, "Starting traffic tunnel ...")
+            if (!TProxyService.nativeReady) {
+                throw IllegalStateException("Native library hev-socks5-tunnel failed to load on this device")
+            }
             val conf = File(filesDir, "tproxy.yml")
             val mapDnsBlock = if (cfg.transparentDns) {
                 """
@@ -151,8 +161,8 @@ class SshVpnService : VpnService() {
             }
         } catch (e: InterruptedException) {
             // shutting down
-        } catch (e: Exception) {
-            val msg = "$stage failed: ${describe(e)}"
+        } catch (t: Throwable) {
+            val msg = "$stage failed: ${describeThrowable(t)}"
             LogStore.append(msg)
             shutdown(msg, Status.ERROR)
         }
@@ -204,12 +214,12 @@ class SshVpnService : VpnService() {
         return s
     }
 
-    private fun describe(e: Exception): String {
-        val messages = generateSequence<Throwable>(e) { it.cause }
+    private fun describeThrowable(t: Throwable): String {
+        val messages = generateSequence(t) { it.cause }
             .mapNotNull { it.message?.takeIf(String::isNotBlank) }
             .distinct()
             .toList()
-        val m = messages.joinToString(" | ").ifBlank { e.javaClass.simpleName }
+        val m = messages.joinToString(" | ").ifBlank { t.javaClass.simpleName }
         return when {
             m.contains("Auth fail", true) || m.contains("authentication failed", true) ->
                 "SSH authentication failed; check username, password, or private key. Details: $m"
@@ -219,8 +229,8 @@ class SshVpnService : VpnService() {
                 "SSH connection refused; check host and port. Details: $m"
             m.contains("UnknownHost", true) || m.contains("Unable to resolve", true) || m.contains("unresolved", true) ->
                 "Server hostname could not be resolved. Details: $m"
-            m.contains("no matching", true) || m.contains("algorithm", true) || m.contains("key exchange", true) ->
-                "SSH algorithm negotiation failed. Details: $m"
+            m.contains("UnsatisfiedLink", true) || m.contains("native library", true) ->
+                "Native tunnel library failed to load. Details: $m"
             m.contains("another VPN", true) || m.contains("permission denied", true) ->
                 "Could not start VPN. Turn off any other active VPN and try again. Details: $m"
             else -> m.take(280)
@@ -230,7 +240,9 @@ class SshVpnService : VpnService() {
     @Synchronized
     private fun shutdown(message: String, status: Status) {
         stopping = true
-        try { TProxyService.TProxyStopService() } catch (_: Throwable) {}
+        try {
+            if (TProxyService.nativeReady) TProxyService.TProxyStopService()
+        } catch (_: Throwable) {}
         try { socks?.stop() } catch (_: Exception) {}
         socks = null
         try { session?.disconnect() } catch (_: Exception) {}
@@ -253,12 +265,18 @@ class SshVpnService : VpnService() {
 
     private fun startForegroundCompat(text: String) {
         val n = buildNotification(text)
-        if (Build.VERSION.SDK_INT >= 34) {
-            startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else if (Build.VERSION.SDK_INT >= 29) {
-            @Suppress("DEPRECATION")
-            startForeground(NOTIF_ID, n, 0)
-        } else {
+        try {
+            if (Build.VERSION.SDK_INT >= 34) {
+                startForeground(NOTIF_ID, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else if (Build.VERSION.SDK_INT >= 29) {
+                @Suppress("DEPRECATION")
+                startForeground(NOTIF_ID, n, 0)
+            } else {
+                startForeground(NOTIF_ID, n)
+            }
+        } catch (t: Throwable) {
+            // Last resort: plain startForeground without type
+            LogStore.append("startForeground typed failed: ${t.message}; retry plain")
             startForeground(NOTIF_ID, n)
         }
     }
