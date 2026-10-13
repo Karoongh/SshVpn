@@ -24,8 +24,8 @@ class Socks5Server(
 
     companion object {
         private const val FAIL_LOG_INTERVAL_MS = 4_000L
-        /** Limit how many channel handshakes run at once (server-friendly). */
         private const val MAX_OPENS_IN_FLIGHT = 6
+        private const val PUBLIC_DNS = "1.1.1.1"
     }
 
     private val limit = maxChannels.coerceIn(8, 128)
@@ -104,7 +104,7 @@ class Socks5Server(
             val cmd = cin.readUnsignedByte()
             cin.readUnsignedByte()
             val atyp = cin.readUnsignedByte()
-            val host: String = when (atyp) {
+            var host: String = when (atyp) {
                 1 -> {
                     val b = ByteArray(4); cin.readFully(b)
                     InetAddress.getByAddress(b).hostAddress ?: return
@@ -120,15 +120,20 @@ class Socks5Server(
                 }
                 else -> { reply(cout, 8); return }
             }
-            val port = cin.readUnsignedShort()
+            var port = cin.readUnsignedShort()
 
             if (cmd != 1) {
                 reply(cout, 7)
                 return
             }
 
-            // Never forward tunnel/DNS/filter ranges back into SSH — they always fail.
-            if (shouldSkip(host, port)) {
+            // Rewrite tunnel-local / broken destinations so the user never has to
+            // touch Private DNS or other system settings.
+            val rewritten = rewriteDestination(host, port)
+            host = rewritten.first
+            port = rewritten.second
+
+            if (shouldReject(host)) {
                 reply(cout, 5)
                 return
             }
@@ -172,13 +177,32 @@ class Socks5Server(
     }
 
     /**
-     * Open a direct-tcpip channel with a short retry loop. Many SSH panels drop
-     * bursts of channel-open requests; spacing + retry fixes most failures.
+     * Map fake tunnel DNS addresses (and DoT port 853) onto a real resolver
+     * reachable through SSH so Android Private DNS works out of the box.
      */
+    private fun rewriteDestination(host: String, port: Int): Pair<String, Int> {
+        if (host.startsWith("198.18.") && (port == 53 || port == 853)) {
+            return PUBLIC_DNS to port
+        }
+        // Some OEMs probe the VPN DNS IP on random ports — send DNS-ish ports to Cloudflare
+        if (host.startsWith("198.18.") && port in listOf(53, 853, 443, 784, 8853)) {
+            return PUBLIC_DNS to if (port == 443 || port == 53) port else 853
+        }
+        return host to port
+    }
+
+    private fun shouldReject(host: String): Boolean {
+        if (host == "127.0.0.1" || host == "0.0.0.0" || host == "::1") return true
+        // Remaining 198.18.x (non-DNS) is not a real internet host
+        if (host.startsWith("198.18.")) return true
+        // Iranian DPI sinkhole — never works via SSH
+        if (host.startsWith("10.10.34.")) return true
+        return false
+    }
+
     private fun openDirectChannel(session: Session, host: String, port: Int): ChannelDirectTCPIP? {
         if (!openGate.tryAcquire(8, TimeUnit.SECONDS)) return null
         try {
-            var lastError: Exception? = null
             repeat(3) { attempt ->
                 try {
                     val ch = synchronized(openLock) {
@@ -191,8 +215,7 @@ class Socks5Server(
                     }
                     ch.connect(12_000)
                     return ch
-                } catch (e: Exception) {
-                    lastError = e
+                } catch (_: Exception) {
                     try {
                         Thread.sleep(80L * (attempt + 1))
                     } catch (_: InterruptedException) {
@@ -204,18 +227,6 @@ class Socks5Server(
         } finally {
             openGate.release()
         }
-    }
-
-    private fun shouldSkip(host: String, port: Int): Boolean {
-        // mapdns / tunnel address space — not reachable via SSH
-        if (host.startsWith("198.18.")) return true
-        // common local / invalid
-        if (host == "127.0.0.1" || host == "0.0.0.0" || host == "::1") return true
-        // Iranian DPI sinkhole often seen in logs — never works through SSH
-        if (host.startsWith("10.10.34.")) return true
-        // DoT to fake DNS IP always fails; real DNS is UDP/53 via mapdns
-        if (port == 853 && host.startsWith("198.18.")) return true
-        return false
     }
 
     private fun logFail(host: String, port: Int, message: String?) {
