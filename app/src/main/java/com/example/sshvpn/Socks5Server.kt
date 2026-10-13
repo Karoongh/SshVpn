@@ -23,15 +23,21 @@ class Socks5Server(
 ) {
 
     companion object {
-        private const val FAIL_LOG_INTERVAL_MS = 5_000L
+        private const val FAIL_LOG_INTERVAL_MS = 4_000L
+        /** Limit how many channel handshakes run at once (server-friendly). */
+        private const val MAX_OPENS_IN_FLIGHT = 6
     }
 
     private val limit = maxChannels.coerceIn(8, 128)
-    private val pool = Executors.newFixedThreadPool(16.coerceAtMost(limit))
+    private val poolSize = 24.coerceAtMost(limit + 8)
+    private val pool = Executors.newFixedThreadPool(poolSize)
     private val gate = Semaphore(limit)
+    private val openGate = Semaphore(MAX_OPENS_IN_FLIGHT)
+    private val openLock = Any()
     private var server: ServerSocket? = null
     private val active = AtomicInteger(0)
     private val failCount = AtomicInteger(0)
+    private val okCount = AtomicInteger(0)
     @Volatile private var lastFailLog = 0L
 
     @Volatile
@@ -40,10 +46,10 @@ class Socks5Server(
     val port: Int get() = server?.localPort ?: -1
 
     fun start() {
-        val s = ServerSocket(0, 256, InetAddress.getByName("127.0.0.1"))
+        val s = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
-        LogStore.append("SOCKS concurrency limit=$limit")
+        LogStore.append("SOCKS concurrency limit=$limit (opens<=$MAX_OPENS_IN_FLIGHT)")
         pool.execute {
             while (running) {
                 try {
@@ -121,30 +127,33 @@ class Socks5Server(
                 return
             }
 
+            // Never forward tunnel/DNS/filter ranges back into SSH — they always fail.
+            if (shouldSkip(host, port)) {
+                reply(cout, 5)
+                return
+            }
+
             val session = sessionProvider()
             if (session == null || !session.isConnected) {
                 reply(cout, 1)
                 return
             }
 
-            val ch = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
-            channel = ch
-            ch.setHost(host)
-            ch.setPort(port)
-            ch.setOrgIPAddress("127.0.0.1")
-            ch.setOrgPort(0)
-
-            try {
-                ch.connect(15_000)
-            } catch (e: Exception) {
-                logFail(host, port, e.message)
+            val ch = openDirectChannel(session, host, port)
+            if (ch == null) {
+                logFail(host, port, "channel is not opened")
                 reply(cout, 5)
                 return
             }
+            channel = ch
 
             reply(cout, 0)
             counted = true
             active.incrementAndGet()
+            val n = okCount.incrementAndGet()
+            if (n <= 3 || n % 50 == 0) {
+                LogStore.append("SOCKS ok $host:$port active=${active.get()}/$limit")
+            }
 
             val rin = ch.inputStream
             val rout = ch.outputStream
@@ -162,12 +171,61 @@ class Socks5Server(
         }
     }
 
+    /**
+     * Open a direct-tcpip channel with a short retry loop. Many SSH panels drop
+     * bursts of channel-open requests; spacing + retry fixes most failures.
+     */
+    private fun openDirectChannel(session: Session, host: String, port: Int): ChannelDirectTCPIP? {
+        if (!openGate.tryAcquire(8, TimeUnit.SECONDS)) return null
+        try {
+            var lastError: Exception? = null
+            repeat(3) { attempt ->
+                try {
+                    val ch = synchronized(openLock) {
+                        val c = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
+                        c.setHost(host)
+                        c.setPort(port)
+                        c.setOrgIPAddress("127.0.0.1")
+                        c.setOrgPort(0)
+                        c
+                    }
+                    ch.connect(12_000)
+                    return ch
+                } catch (e: Exception) {
+                    lastError = e
+                    try {
+                        Thread.sleep(80L * (attempt + 1))
+                    } catch (_: InterruptedException) {
+                        return null
+                    }
+                }
+            }
+            return null
+        } finally {
+            openGate.release()
+        }
+    }
+
+    private fun shouldSkip(host: String, port: Int): Boolean {
+        // mapdns / tunnel address space — not reachable via SSH
+        if (host.startsWith("198.18.")) return true
+        // common local / invalid
+        if (host == "127.0.0.1" || host == "0.0.0.0" || host == "::1") return true
+        // Iranian DPI sinkhole often seen in logs — never works through SSH
+        if (host.startsWith("10.10.34.")) return true
+        // DoT to fake DNS IP always fails; real DNS is UDP/53 via mapdns
+        if (port == 853 && host.startsWith("198.18.")) return true
+        return false
+    }
+
     private fun logFail(host: String, port: Int, message: String?) {
         val n = failCount.incrementAndGet()
         val now = System.currentTimeMillis()
         if (now - lastFailLog < FAIL_LOG_INTERVAL_MS) return
         lastFailLog = now
-        LogStore.append("SOCKS fail $host:$port (${message ?: "?"}) totalFails=$n active=${active.get()}/$limit")
+        LogStore.append(
+            "SOCKS fail $host:$port (${message ?: "?"}) fails=$n ok=${okCount.get()} active=${active.get()}/$limit"
+        )
     }
 
     private fun reply(out: OutputStream, code: Int) {
