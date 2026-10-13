@@ -5,8 +5,19 @@ package hev.htproxy
  * hev.htproxy.TProxyService because the native library registers its JNI methods on it.
  */
 object TProxyService {
+    @JvmField
+    val nativeReady: Boolean
+
     init {
-        System.loadLibrary("hev-socks5-tunnel")
+        var ok = false
+        try {
+            System.loadLibrary("hev-socks5-tunnel")
+            ok = true
+        } catch (t: Throwable) {
+            // Never crash the process during class init; callers check nativeReady.
+            android.util.Log.e("TProxyService", "Failed to load hev-socks5-tunnel", t)
+        }
+        nativeReady = ok
     }
 
     external fun TProxyStartService(configPath: String, fd: Int): Boolean
