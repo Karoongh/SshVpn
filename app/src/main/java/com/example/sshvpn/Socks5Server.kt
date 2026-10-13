@@ -9,17 +9,29 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Minimal SOCKS5 server (CONNECT only, no auth) bound to 127.0.0.1.
- * Every connection is forwarded through an SSH "direct-tcpip" channel.
+ * SOCKS5 server (CONNECT only) on 127.0.0.1.
+ * Forwards through SSH direct-tcpip with a hard concurrency cap to protect
+ * the phone (CPU/heat) and the SSH session (MaxSessions / channel limits).
  */
 class Socks5Server(private val sessionProvider: () -> Session?) {
 
-    private val pool = Executors.newCachedThreadPool()
+    companion object {
+        // Keep concurrent SSH channels modest — many phones overheat above this.
+        private const val MAX_CONCURRENT = 48
+        private const val FAIL_LOG_INTERVAL_MS = 5_000L
+    }
+
+    private val pool = Executors.newFixedThreadPool(16)
+    private val gate = Semaphore(MAX_CONCURRENT)
     private var server: ServerSocket? = null
     private val active = AtomicInteger(0)
+    private val failCount = AtomicInteger(0)
+    @Volatile private var lastFailLog = 0L
 
     @Volatile
     private var running = false
@@ -36,7 +48,18 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
                     val c = s.accept()
                     c.tcpNoDelay = true
                     c.soTimeout = 0
-                    pool.execute { handle(c) }
+                    // Drop if saturated — better than melting the device
+                    if (!gate.tryAcquire()) {
+                        try { c.close() } catch (_: Exception) {}
+                        continue
+                    }
+                    pool.execute {
+                        try {
+                            handle(c)
+                        } finally {
+                            gate.release()
+                        }
+                    }
                 } catch (e: Exception) {
                     if (running) continue else break
                 }
@@ -51,25 +74,28 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
         } catch (_: Exception) {
         }
         pool.shutdownNow()
+        try {
+            pool.awaitTermination(2, TimeUnit.SECONDS)
+        } catch (_: Exception) {
+        }
     }
 
     private fun handle(client: Socket) {
         var channel: ChannelDirectTCPIP? = null
+        var counted = false
         try {
             val cin = DataInputStream(client.getInputStream())
             val cout = client.getOutputStream()
 
-            // Greeting
             if (cin.readUnsignedByte() != 5) return
             val nMethods = cin.readUnsignedByte()
             cin.readFully(ByteArray(nMethods))
             cout.write(byteArrayOf(5, 0))
             cout.flush()
 
-            // Request
             if (cin.readUnsignedByte() != 5) return
             val cmd = cin.readUnsignedByte()
-            cin.readUnsignedByte() // reserved
+            cin.readUnsignedByte()
             val atyp = cin.readUnsignedByte()
             val host: String = when (atyp) {
                 1 -> {
@@ -89,7 +115,7 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
             }
             val port = cin.readUnsignedShort()
 
-            if (cmd != 1) { // only CONNECT
+            if (cmd != 1) {
                 reply(cout, 7)
                 return
             }
@@ -104,37 +130,44 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
             channel = ch
             ch.setHost(host)
             ch.setPort(port)
-            // Required by some SSH servers for direct-tcpip
             ch.setOrgIPAddress("127.0.0.1")
             ch.setOrgPort(0)
 
             try {
-                ch.connect(20000)
+                ch.connect(15_000)
             } catch (e: Exception) {
-                LogStore.append("SOCKS fail $host:$port -> ${e.message}")
+                logFail(host, port, e.message)
                 reply(cout, 5)
                 return
             }
 
             reply(cout, 0)
-            val n = active.incrementAndGet()
-            if (n <= 5 || n % 20 == 0) {
-                LogStore.append("SOCKS open $host:$port (active=$n)")
-            }
+            counted = true
+            active.incrementAndGet()
 
             val rin = ch.inputStream
             val rout = ch.outputStream
-            val t = Thread { pump(rin, cout) }
-            t.isDaemon = true
-            t.start()
+            val t = Thread { pump(rin, cout) }.also {
+                it.isDaemon = true
+                it.start()
+            }
             pump(cin, rout)
-            t.join(3000)
+            t.join(2_000)
         } catch (_: Exception) {
         } finally {
-            active.decrementAndGet()
+            if (counted) active.decrementAndGet()
             try { channel?.disconnect() } catch (_: Exception) {}
             try { client.close() } catch (_: Exception) {}
         }
+    }
+
+    private fun logFail(host: String, port: Int, message: String?) {
+        val n = failCount.incrementAndGet()
+        val now = System.currentTimeMillis()
+        // Rate-limit: at most one fail line every few seconds
+        if (now - lastFailLog < FAIL_LOG_INTERVAL_MS) return
+        lastFailLog = now
+        LogStore.append("SOCKS fail $host:$port (${message ?: "?"}) totalFails=$n active=${active.get()}")
     }
 
     private fun reply(out: OutputStream, code: Int) {
