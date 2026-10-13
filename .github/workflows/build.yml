@@ -11,6 +11,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Decode fixed signing keystore
+        run: |
+          set -e
+          test -f keystore/karoon-debug.jks.base64
+          base64 -d keystore/karoon-debug.jks.base64 > keystore/karoon-debug.jks
+          ls -la keystore/karoon-debug.jks
+
       - name: Fetch complete hev-socks5-tunnel (with submodules)
         run: |
           set -e
@@ -28,7 +35,6 @@ jobs:
           test -f "$JNI_DIR/hev-socks5-tunnel/src/hev-jni.c"
           test -f "$JNI_DIR/hev-socks5-tunnel/src/hev-main.c"
           test -f "$JNI_DIR/hev-socks5-tunnel/src/misc/hev-utils.h"
-          ls -la "$JNI_DIR/hev-socks5-tunnel/src"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
