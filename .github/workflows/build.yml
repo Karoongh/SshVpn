@@ -11,6 +11,31 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Fetch complete hev-socks5-tunnel (with submodules)
+        run: |
+          set -e
+          JNI_DIR="app/src/main/jni"
+          # Replace incomplete upload with a full upstream tree
+          rm -rf "$JNI_DIR/hev-socks5-tunnel"
+          git clone --depth 1 --recursive https://github.com/heiher/hev-socks5-tunnel.git "$JNI_DIR/hev-socks5-tunnel"
+          # Keep our top-level Android.mk that includes the tunnel module
+          # Ensure Application.mk has ANDROID defined for hev-jni.c
+          cat > "$JNI_DIR/Application.mk" <<'EOF'
+          APP_OPTIM := release
+          APP_PLATFORM := android-26
+          APP_ABI := armeabi-v7a arm64-v8a x86 x86_64
+          APP_CFLAGS := -O3 -DANDROID
+          APP_SUPPORT_FLEXIBLE_PAGE_SIZES := true
+          EOF
+          # Top-level Android.mk must include the tunnel
+          cat > "$JNI_DIR/Android.mk" <<'EOF'
+          include $(call all-subdir-makefiles)
+          EOF
+          # hev-socks5-tunnel ships its own Android.mk; ensure it is used
+          ls -la "$JNI_DIR/hev-socks5-tunnel"
+          test -f "$JNI_DIR/hev-socks5-tunnel/src/hev-jni.c"
+          test -f "$JNI_DIR/hev-socks5-tunnel/src/hev-main.c"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
