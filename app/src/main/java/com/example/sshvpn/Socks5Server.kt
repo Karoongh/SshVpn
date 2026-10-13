@@ -14,22 +14,22 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * SOCKS5 server (CONNECT only) on 127.0.0.1.
- * Forwards through SSH direct-tcpip with a configurable concurrency cap.
+ * SOCKS5 on 127.0.0.1 — CONNECT via SSH direct-tcpip, optional UDP ASSOCIATE via UDPGW.
  */
 class Socks5Server(
     private val sessionProvider: () -> Session?,
     maxChannels: Int = 48,
+    private val udpgw: UdpgwClient? = null,
 ) {
 
     companion object {
         private const val FAIL_LOG_INTERVAL_MS = 4_000L
-        private const val MAX_OPENS_IN_FLIGHT = 6
+        private const val MAX_OPENS_IN_FLIGHT = 16
         private const val PUBLIC_DNS = "1.1.1.1"
     }
 
     private val limit = maxChannels.coerceIn(8, 128)
-    private val poolSize = 24.coerceAtMost(limit + 8)
+    private val poolSize = 32.coerceAtMost(limit + 8)
     private val pool = Executors.newFixedThreadPool(poolSize)
     private val gate = Semaphore(limit)
     private val openGate = Semaphore(MAX_OPENS_IN_FLIGHT)
@@ -49,7 +49,8 @@ class Socks5Server(
         val s = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
-        LogStore.append("SOCKS concurrency limit=$limit (opens<=$MAX_OPENS_IN_FLIGHT)")
+        val udpInfo = if (udpgw != null && udpgw.localRelayPort > 0) " udpRelay=${udpgw.localRelayPort}" else " udp=tcp-fallback"
+        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT$udpInfo")
         pool.execute {
             while (running) {
                 try {
@@ -76,15 +77,9 @@ class Socks5Server(
 
     fun stop() {
         running = false
-        try {
-            server?.close()
-        } catch (_: Exception) {
-        }
+        try { server?.close() } catch (_: Exception) {}
         pool.shutdownNow()
-        try {
-            pool.awaitTermination(2, TimeUnit.SECONDS)
-        } catch (_: Exception) {
-        }
+        try { pool.awaitTermination(2, TimeUnit.SECONDS) } catch (_: Exception) {}
     }
 
     private fun handle(client: Socket) {
@@ -104,31 +99,41 @@ class Socks5Server(
             val cmd = cin.readUnsignedByte()
             cin.readUnsignedByte()
             val atyp = cin.readUnsignedByte()
-            var host: String = when (atyp) {
-                1 -> {
-                    val b = ByteArray(4); cin.readFully(b)
-                    InetAddress.getByAddress(b).hostAddress ?: return
+
+            // UDP ASSOCIATE
+            if (cmd == 3) {
+                // consume address
+                skipAddr(cin, atyp)
+                val relay = udpgw?.localRelayPort ?: -1
+                if (relay <= 0) {
+                    reply(cout, 7) // protocol error / not supported
+                    return
                 }
-                3 -> {
-                    val len = cin.readUnsignedByte()
-                    val b = ByteArray(len); cin.readFully(b)
-                    String(b, Charsets.US_ASCII)
-                }
-                4 -> {
-                    val b = ByteArray(16); cin.readFully(b)
-                    InetAddress.getByAddress(b).hostAddress ?: return
-                }
-                else -> { reply(cout, 8); return }
+                // Success: bind 127.0.0.1:relay
+                val rp = relay
+                cout.write(
+                    byteArrayOf(
+                        5, 0, 0, 1,
+                        127, 0, 0, 1,
+                        (rp shr 8).toByte(), (rp and 0xff).toByte(),
+                    )
+                )
+                cout.flush()
+                // Keep TCP control connection open until client closes (RFC1928)
+                try {
+                    while (client.getInputStream().read() >= 0) { /* hold */ }
+                } catch (_: Exception) {}
+                return
             }
-            var port = cin.readUnsignedShort()
 
             if (cmd != 1) {
                 reply(cout, 7)
                 return
             }
 
-            // Rewrite tunnel-local / broken destinations so the user never has to
-            // touch Private DNS or other system settings.
+            var host: String = readHost(cin, atyp) ?: return
+            var port = cin.readUnsignedShort()
+
             val rewritten = rewriteDestination(host, port)
             host = rewritten.first
             port = rewritten.second
@@ -162,10 +167,7 @@ class Socks5Server(
 
             val rin = ch.inputStream
             val rout = ch.outputStream
-            val t = Thread { pump(rin, cout) }.also {
-                it.isDaemon = true
-                it.start()
-            }
+            val t = Thread { pump(rin, cout) }.also { it.isDaemon = true; it.start() }
             pump(cin, rout)
             t.join(2_000)
         } catch (_: Exception) {
@@ -176,16 +178,38 @@ class Socks5Server(
         }
     }
 
-    /**
-     * Map fake tunnel DNS addresses (and DoT port 853) onto a real resolver
-     * reachable through SSH so Android Private DNS works out of the box.
-     */
-    private fun rewriteDestination(host: String, port: Int): Pair<String, Int> {
-        if (host.startsWith("198.18.") && (port == 53 || port == 853)) {
-            return PUBLIC_DNS to port
+    private fun skipAddr(cin: DataInputStream, atyp: Int) {
+        when (atyp) {
+            1 -> cin.readFully(ByteArray(4))
+            3 -> {
+                val n = cin.readUnsignedByte()
+                cin.readFully(ByteArray(n))
+            }
+            4 -> cin.readFully(ByteArray(16))
+            else -> {}
         }
-        // Some OEMs probe the VPN DNS IP on random ports — send DNS-ish ports to Cloudflare
-        if (host.startsWith("198.18.") && port in listOf(53, 853, 443, 784, 8853)) {
+        cin.readUnsignedShort() // port
+    }
+
+    private fun readHost(cin: DataInputStream, atyp: Int): String? = when (atyp) {
+        1 -> {
+            val b = ByteArray(4); cin.readFully(b)
+            InetAddress.getByAddress(b).hostAddress
+        }
+        3 -> {
+            val n = cin.readUnsignedByte()
+            val b = ByteArray(n); cin.readFully(b)
+            String(b, Charsets.US_ASCII)
+        }
+        4 -> {
+            val b = ByteArray(16); cin.readFully(b)
+            InetAddress.getByAddress(b).hostAddress
+        }
+        else -> null
+    }
+
+    private fun rewriteDestination(host: String, port: Int): Pair<String, Int> {
+        if (host.startsWith("198.18.") && (port == 53 || port == 853 || port == 443 || port == 784 || port == 8853)) {
             return PUBLIC_DNS to if (port == 443 || port == 53) port else 853
         }
         return host to port
@@ -193,9 +217,7 @@ class Socks5Server(
 
     private fun shouldReject(host: String): Boolean {
         if (host == "127.0.0.1" || host == "0.0.0.0" || host == "::1") return true
-        // Remaining 198.18.x (non-DNS) is not a real internet host
         if (host.startsWith("198.18.")) return true
-        // Iranian DPI sinkhole — never works via SSH
         if (host.startsWith("10.10.34.")) return true
         return false
     }
@@ -216,11 +238,7 @@ class Socks5Server(
                     ch.connect(12_000)
                     return ch
                 } catch (_: Exception) {
-                    try {
-                        Thread.sleep(80L * (attempt + 1))
-                    } catch (_: InterruptedException) {
-                        return null
-                    }
+                    try { Thread.sleep(60L * (attempt + 1)) } catch (_: InterruptedException) { return null }
                 }
             }
             return null
@@ -245,7 +263,7 @@ class Socks5Server(
     }
 
     private fun pump(src: InputStream, dst: OutputStream) {
-        val buf = ByteArray(32 * 1024)
+        val buf = ByteArray(64 * 1024)
         try {
             while (true) {
                 val n = src.read(buf)
