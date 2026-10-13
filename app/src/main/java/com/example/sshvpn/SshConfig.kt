@@ -15,6 +15,8 @@ data class SshConfig(
     val udpgwPort: Int = 7300,
     val transparentDns: Boolean = true,
     val protocol: String = "SSH-Direct",
+    /** Max concurrent SOCKS/SSH channels (8..128). Higher = more parallel apps, more heat. */
+    val maxChannels: Int = 48,
 ) {
     fun toJson(): String = JSONObject().apply {
         put("host", host)
@@ -27,6 +29,7 @@ data class SshConfig(
         put("udpgwPort", udpgwPort)
         put("transparentDns", transparentDns)
         put("protocol", protocol)
+        put("maxChannels", maxChannels.coerceIn(8, 128))
     }.toString()
 
     companion object {
@@ -46,6 +49,7 @@ data class SshConfig(
                 udpgwPort = o.optInt("udpgwPort", o.optInt("udpgw", 7300)).let { if (it in 1..65535) it else 7300 },
                 transparentDns = o.optBoolean("transparentDns", o.optBoolean("dns", true)),
                 protocol = o.optString("protocol", "SSH-Direct"),
+                maxChannels = o.optInt("maxChannels", 48).coerceIn(8, 128),
             )
         } catch (e: Exception) {
             null
@@ -53,15 +57,6 @@ data class SshConfig(
     }
 }
 
-/**
- * Parses common SSH config formats:
- *   ssh://user:pass@host:port#name
- *   host:port@user:pass
- *   host:port:user:pass
- *   JSON objects
- *   key=value lines
- *   base64-wrapped configs
- */
 object ConfigParser {
 
     fun parse(raw: String): SshConfig? = parse(raw, allowBase64 = true)
@@ -174,6 +169,7 @@ object ConfigParser {
                 ?: map["udpgwport"]?.toIntOrNull()?.takeIf { it in 1..65535 } ?: 7300,
             transparentDns = map["dns"]?.lowercase() !in listOf("off", "false", "0", "no"),
             protocol = map["protocol"] ?: "SSH-Direct",
+            maxChannels = map["maxchannels"]?.toIntOrNull()?.coerceIn(8, 128) ?: 48,
         )
     }
 
