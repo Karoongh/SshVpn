@@ -12,11 +12,23 @@ android {
         applicationId = "com.example.sshvpn"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.3"
 
         ndk {
             abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+        }
+    }
+
+    // Fixed key so every CI build can update over the previous install.
+    // Credentials documented in keystore/SIGNING.md
+    signingConfigs {
+        create("karoon") {
+            val ks = rootProject.file("keystore/karoon-debug.jks")
+            storeFile = ks
+            storePassword = "karoon_tunnel_debug"
+            keyAlias = "karoon"
+            keyPassword = "karoon_tunnel_debug"
         }
     }
 
@@ -27,10 +39,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("karoon")
+        }
         release {
             isMinifyEnabled = false
-            // For personal use the debug key is enough. Configure your own signingConfig to publish.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = signingConfigs.getByName("karoon")
         }
     }
 
@@ -44,6 +58,5 @@ android {
 }
 
 dependencies {
-    // Maintained JSch fork with modern ciphers/KEX and ed25519/RSA-SHA2 key support.
     implementation("com.github.mwiede:jsch:0.2.20")
 }
