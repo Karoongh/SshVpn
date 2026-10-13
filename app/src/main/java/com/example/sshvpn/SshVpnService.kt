@@ -89,12 +89,16 @@ class SshVpnService : VpnService() {
 
             stage = "Creating Android VPN interface"
             VpnState.update(Status.CONNECTING, "Starting Android VPN ...")
+            // Real public resolvers (not 198.18.x) so Android Private DNS / DoT
+            // (port 853) reaches a real server through the tunnel — no phone
+            // settings change required.
             val builder = Builder()
                 .setSession(cfg.name.ifBlank { "Karoon Tunnel" })
                 .setMtu(MTU)
                 .addAddress("198.18.0.1", 30)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("198.18.0.2")
+                .addDnsServer("1.1.1.1")
+                .addDnsServer("8.8.8.8")
 
             try {
                 builder.allowFamily(OsConstants.AF_INET)
@@ -103,7 +107,7 @@ class SshVpnService : VpnService() {
             if (Build.VERSION.SDK_INT >= 29) {
                 try { builder.setMetered(false) } catch (_: Exception) {}
             }
-
+            // Prefer underlying network for this app's SSH socket only
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
@@ -112,7 +116,7 @@ class SshVpnService : VpnService() {
             val pfd = builder.establish()
                 ?: throw IllegalStateException("VPN permission denied or another VPN is active")
             tun = pfd
-            LogStore.append("VPN interface established (MTU=$MTU)")
+            LogStore.append("VPN interface established (MTU=$MTU, DNS=1.1.1.1/8.8.8.8)")
 
             stage = "Starting traffic tunnel (hev-socks5-tunnel)"
             VpnState.update(Status.CONNECTING, "Starting traffic tunnel ...")
@@ -120,6 +124,8 @@ class SshVpnService : VpnService() {
                 throw IllegalStateException("Native library hev-socks5-tunnel failed to load on this device")
             }
 
+            // No mapdns: DNS (UDP/TCP/DoT) goes to 1.1.1.1 / 8.8.8.8 through
+            // the tunnel. udp:'tcp' lets hev carry UDP DNS over the SOCKS TCP path.
             val conf = File(filesDir, "tproxy.yml")
             conf.writeText(
                 """
@@ -130,12 +136,6 @@ class SshVpnService : VpnService() {
                   port: ${server.port}
                   address: 127.0.0.1
                   udp: 'tcp'
-                mapdns:
-                  address: 198.18.0.2
-                  port: 53
-                  network: 198.18.0.0
-                  netmask: 255.255.0.0
-                  cache-size: 10000
                 misc:
                   task-stack-size: 86016
                   connect-timeout: 15000
