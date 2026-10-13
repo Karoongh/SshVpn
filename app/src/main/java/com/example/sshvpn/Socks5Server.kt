@@ -9,17 +9,17 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Minimal SOCKS5 server (CONNECT only, no auth) bound to 127.0.0.1.
- * Every connection is forwarded through an SSH "direct-tcpip" channel, which is what
- * `ssh -D` does. hev-socks5-tunnel connects here with domain names (mapdns), so DNS
- * is resolved on the SSH server side.
+ * Every connection is forwarded through an SSH "direct-tcpip" channel.
  */
 class Socks5Server(private val sessionProvider: () -> Session?) {
 
     private val pool = Executors.newCachedThreadPool()
     private var server: ServerSocket? = null
+    private val active = AtomicInteger(0)
 
     @Volatile
     private var running = false
@@ -27,7 +27,7 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
     val port: Int get() = server?.localPort ?: -1
 
     fun start() {
-        val s = ServerSocket(0, 128, InetAddress.getByName("127.0.0.1"))
+        val s = ServerSocket(0, 256, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
         pool.execute {
@@ -35,6 +35,7 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
                 try {
                     val c = s.accept()
                     c.tcpNoDelay = true
+                    c.soTimeout = 0
                     pool.execute { handle(c) }
                 } catch (e: Exception) {
                     if (running) continue else break
@@ -88,7 +89,7 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
             }
             val port = cin.readUnsignedShort()
 
-            if (cmd != 1) { // only CONNECT; UDP cannot travel over SSH
+            if (cmd != 1) { // only CONNECT
                 reply(cout, 7)
                 return
             }
@@ -103,24 +104,34 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
             channel = ch
             ch.setHost(host)
             ch.setPort(port)
-            val rin = ch.inputStream
-            val rout = ch.outputStream
+            // Required by some SSH servers for direct-tcpip
+            ch.setOrgIPAddress("127.0.0.1")
+            ch.setOrgPort(0)
+
             try {
-                ch.connect(15000)
+                ch.connect(20000)
             } catch (e: Exception) {
+                LogStore.append("SOCKS fail $host:$port -> ${e.message}")
                 reply(cout, 5)
                 return
             }
 
             reply(cout, 0)
+            val n = active.incrementAndGet()
+            if (n <= 5 || n % 20 == 0) {
+                LogStore.append("SOCKS open $host:$port (active=$n)")
+            }
 
-            val t = Thread { pump(rin, cout, client) }
+            val rin = ch.inputStream
+            val rout = ch.outputStream
+            val t = Thread { pump(rin, cout) }
             t.isDaemon = true
             t.start()
-            pump(cin, rout, client)
-            t.join(2000)
+            pump(cin, rout)
+            t.join(3000)
         } catch (_: Exception) {
         } finally {
+            active.decrementAndGet()
             try { channel?.disconnect() } catch (_: Exception) {}
             try { client.close() } catch (_: Exception) {}
         }
@@ -131,8 +142,8 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
         out.flush()
     }
 
-    private fun pump(src: InputStream, dst: OutputStream, client: Socket) {
-        val buf = ByteArray(16 * 1024)
+    private fun pump(src: InputStream, dst: OutputStream) {
+        val buf = ByteArray(32 * 1024)
         try {
             while (true) {
                 val n = src.read(buf)
@@ -141,8 +152,6 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
                 dst.flush()
             }
         } catch (_: Exception) {
-        } finally {
-            try { client.close() } catch (_: Exception) {}
         }
     }
 }
