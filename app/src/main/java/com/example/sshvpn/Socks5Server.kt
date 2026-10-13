@@ -15,19 +15,20 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * SOCKS5 server (CONNECT only) on 127.0.0.1.
- * Forwards through SSH direct-tcpip with a hard concurrency cap to protect
- * the phone (CPU/heat) and the SSH session (MaxSessions / channel limits).
+ * Forwards through SSH direct-tcpip with a configurable concurrency cap.
  */
-class Socks5Server(private val sessionProvider: () -> Session?) {
+class Socks5Server(
+    private val sessionProvider: () -> Session?,
+    maxChannels: Int = 48,
+) {
 
     companion object {
-        // Keep concurrent SSH channels modest — many phones overheat above this.
-        private const val MAX_CONCURRENT = 48
         private const val FAIL_LOG_INTERVAL_MS = 5_000L
     }
 
-    private val pool = Executors.newFixedThreadPool(16)
-    private val gate = Semaphore(MAX_CONCURRENT)
+    private val limit = maxChannels.coerceIn(8, 128)
+    private val pool = Executors.newFixedThreadPool(16.coerceAtMost(limit))
+    private val gate = Semaphore(limit)
     private var server: ServerSocket? = null
     private val active = AtomicInteger(0)
     private val failCount = AtomicInteger(0)
@@ -42,13 +43,13 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
         val s = ServerSocket(0, 256, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
+        LogStore.append("SOCKS concurrency limit=$limit")
         pool.execute {
             while (running) {
                 try {
                     val c = s.accept()
                     c.tcpNoDelay = true
                     c.soTimeout = 0
-                    // Drop if saturated — better than melting the device
                     if (!gate.tryAcquire()) {
                         try { c.close() } catch (_: Exception) {}
                         continue
@@ -164,10 +165,9 @@ class Socks5Server(private val sessionProvider: () -> Session?) {
     private fun logFail(host: String, port: Int, message: String?) {
         val n = failCount.incrementAndGet()
         val now = System.currentTimeMillis()
-        // Rate-limit: at most one fail line every few seconds
         if (now - lastFailLog < FAIL_LOG_INTERVAL_MS) return
         lastFailLog = now
-        LogStore.append("SOCKS fail $host:$port (${message ?: "?"}) totalFails=$n active=${active.get()}")
+        LogStore.append("SOCKS fail $host:$port (${message ?: "?"}) totalFails=$n active=${active.get()}/$limit")
     }
 
     private fun reply(out: OutputStream, code: Int) {
