@@ -25,12 +25,13 @@ class SshVpnService : VpnService() {
         const val EXTRA_CONFIG = "config"
         private const val CHANNEL_ID = "karoon_vpn"
         private const val NOTIF_ID = 1
-        private const val MTU = 1280
+        private const val MTU = 1200
     }
 
     private var worker: Thread? = null
     private var session: Session? = null
     private var socks: Socks5Server? = null
+    private var udpgw: UdpgwClient? = null
     private var tun: ParcelFileDescriptor? = null
 
     @Volatile
@@ -80,18 +81,28 @@ class SshVpnService : VpnService() {
             session = s
             LogStore.append("SSH session established")
 
+            stage = "Starting UDPGW"
+            var gw: UdpgwClient? = null
+            if (cfg.udpgwPort in 1..65535) {
+                VpnState.update(Status.CONNECTING, "Starting UDPGW ${cfg.udpgwPort} ...")
+                val client = UdpgwClient({ session }, cfg.udpgwPort)
+                if (client.start()) {
+                    gw = client
+                    udpgw = client
+                } else {
+                    LogStore.append("UDPGW unavailable — UDP/QUIC apps may be limited")
+                }
+            }
+
             stage = "Starting local SOCKS5 proxy"
             VpnState.update(Status.CONNECTING, "Starting local proxy ...")
-            val server = Socks5Server({ session }, cfg.maxChannels)
+            val server = Socks5Server({ session }, cfg.maxChannels, gw)
             server.start()
             socks = server
             LogStore.append("Local SOCKS5 on port ${server.port}")
 
             stage = "Creating Android VPN interface"
             VpnState.update(Status.CONNECTING, "Starting Android VPN ...")
-            // Real public resolvers (not 198.18.x) so Android Private DNS / DoT
-            // (port 853) reaches a real server through the tunnel — no phone
-            // settings change required.
             val builder = Builder()
                 .setSession(cfg.name.ifBlank { "Karoon Tunnel" })
                 .setMtu(MTU)
@@ -107,7 +118,6 @@ class SshVpnService : VpnService() {
             if (Build.VERSION.SDK_INT >= 29) {
                 try { builder.setMetered(false) } catch (_: Exception) {}
             }
-            // Prefer underlying network for this app's SSH socket only
             try {
                 builder.addDisallowedApplication(packageName)
             } catch (_: Exception) {
@@ -124,8 +134,8 @@ class SshVpnService : VpnService() {
                 throw IllegalStateException("Native library hev-socks5-tunnel failed to load on this device")
             }
 
-            // No mapdns: DNS (UDP/TCP/DoT) goes to 1.1.1.1 / 8.8.8.8 through
-            // the tunnel. udp:'tcp' lets hev carry UDP DNS over the SOCKS TCP path.
+            // Prefer real UDP via SOCKS UDP ASSOCIATE when UDPGW is up (YouTube/QUIC).
+            val udpMode = if (gw != null) "udp" else "tcp"
             val conf = File(filesDir, "tproxy.yml")
             conf.writeText(
                 """
@@ -135,7 +145,7 @@ class SshVpnService : VpnService() {
                 socks5:
                   port: ${server.port}
                   address: 127.0.0.1
-                  udp: 'tcp'
+                  udp: '$udpMode'
                 misc:
                   task-stack-size: 86016
                   connect-timeout: 15000
@@ -144,7 +154,7 @@ class SshVpnService : VpnService() {
                   log-level: warn
                 """.trimIndent() + "\n"
             )
-            LogStore.append("tproxy.yml written; starting hev on fd=${pfd.fd}")
+            LogStore.append("tproxy.yml written (udp=$udpMode); starting hev on fd=${pfd.fd}")
             if (!TProxyService.TProxyStartService(conf.absolutePath, pfd.fd)) {
                 throw IllegalStateException("Failed to start hev-socks5-tunnel")
             }
@@ -208,8 +218,13 @@ class SshVpnService : VpnService() {
 
         s.setConfig("StrictHostKeyChecking", "no")
         s.setConfig("PreferredAuthentications", "publickey,keyboard-interactive,password")
+        // Prefer faster modern ciphers; disable compression for video throughput
+        s.setConfig("compression.s2c", "none")
+        s.setConfig("compression.c2s", "none")
+        s.setConfig("cipher.s2c", "aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com")
+        s.setConfig("cipher.c2s", "aes128-ctr,aes192-ctr,aes256-ctr,aes128-gcm@openssh.com,aes256-gcm@openssh.com")
         s.setServerAliveInterval(15000)
-        s.setServerAliveCountMax(3)
+        s.setServerAliveCountMax(4)
         s.connect(20000)
         return s
     }
@@ -245,6 +260,8 @@ class SshVpnService : VpnService() {
         } catch (_: Throwable) {}
         try { socks?.stop() } catch (_: Exception) {}
         socks = null
+        try { udpgw?.stop() } catch (_: Exception) {}
+        udpgw = null
         try { session?.disconnect() } catch (_: Exception) {}
         session = null
         try { tun?.close() } catch (_: Exception) {}
