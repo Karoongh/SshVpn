@@ -24,8 +24,10 @@ class Socks5Server(
 
     companion object {
         private const val FAIL_LOG_INTERVAL_MS = 4_000L
-        private const val MAX_OPENS_IN_FLIGHT = 16
+        private const val MAX_OPENS_IN_FLIGHT = 12
         private const val PUBLIC_DNS = "1.1.1.1"
+        /** Drop idle data sockets so stuck video channels free the gate. */
+        private const val DATA_IDLE_TIMEOUT_MS = 120_000
     }
 
     private val limit = maxChannels.coerceIn(8, 128)
@@ -56,8 +58,8 @@ class Socks5Server(
                 try {
                     val c = s.accept()
                     c.tcpNoDelay = true
-                    c.soTimeout = 0
-                    if (!gate.tryAcquire()) {
+                    // Wait a few seconds for a free slot (helps speed test under load)
+                    if (!gate.tryAcquire(4, TimeUnit.SECONDS)) {
                         try { c.close() } catch (_: Exception) {}
                         continue
                     }
@@ -86,6 +88,7 @@ class Socks5Server(
         var channel: ChannelDirectTCPIP? = null
         var counted = false
         try {
+            client.soTimeout = 20_000 // handshake must be quick
             val cin = DataInputStream(client.getInputStream())
             val cout = client.getOutputStream()
 
@@ -100,16 +103,13 @@ class Socks5Server(
             cin.readUnsignedByte()
             val atyp = cin.readUnsignedByte()
 
-            // UDP ASSOCIATE
             if (cmd == 3) {
-                // consume address
                 skipAddr(cin, atyp)
                 val relay = udpgw?.localRelayPort ?: -1
                 if (relay <= 0) {
-                    reply(cout, 7) // protocol error / not supported
+                    reply(cout, 7)
                     return
                 }
-                // Success: bind 127.0.0.1:relay
                 val rp = relay
                 cout.write(
                     byteArrayOf(
@@ -119,7 +119,7 @@ class Socks5Server(
                     )
                 )
                 cout.flush()
-                // Keep TCP control connection open until client closes (RFC1928)
+                client.soTimeout = 0
                 try {
                     while (client.getInputStream().read() >= 0) { /* hold */ }
                 } catch (_: Exception) {}
@@ -165,6 +165,9 @@ class Socks5Server(
                 LogStore.append("SOCKS ok $host:$port active=${active.get()}/$limit")
             }
 
+            // Idle timeout frees slots when a video stream stalls
+            client.soTimeout = DATA_IDLE_TIMEOUT_MS
+
             val rin = ch.inputStream
             val rout = ch.outputStream
             val t = Thread { pump(rin, cout) }.also { it.isDaemon = true; it.start() }
@@ -188,7 +191,7 @@ class Socks5Server(
             4 -> cin.readFully(ByteArray(16))
             else -> {}
         }
-        cin.readUnsignedShort() // port
+        cin.readUnsignedShort()
     }
 
     private fun readHost(cin: DataInputStream, atyp: Int): String? = when (atyp) {
