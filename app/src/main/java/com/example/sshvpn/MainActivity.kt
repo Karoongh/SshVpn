@@ -29,7 +29,7 @@ import android.widget.Toast
 import java.util.ArrayDeque
 import kotlin.math.max
 
-/** Bottom-nav UI: Home | Configs | Speed | Logs | Settings */
+/** Bottom-nav UI: Home | Configs | Stats | Logs | More */
 class MainActivity : Activity() {
 
     private companion object {
@@ -64,10 +64,10 @@ class MainActivity : Activity() {
 
     private lateinit var configsList: LinearLayout
     private lateinit var tvLogs: TextView
-    private lateinit var spark: SparklineView
-    private lateinit var tvSpeedDown: TextView
-    private lateinit var tvSpeedUp: TextView
-    private lateinit var tvSpeedLat: TextView
+    private lateinit var chartUp: TrafficChartView
+    private lateinit var chartDown: TrafficChartView
+    private lateinit var tvUplinkTotal: TextView
+    private lateinit var tvDownlinkTotal: TextView
     private lateinit var etMaxChannels: EditText
 
     private val navButtons = ArrayList<TextView>()
@@ -75,8 +75,11 @@ class MainActivity : Activity() {
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var speedRunning = false
-    private val speedSamples = ArrayDeque<Float>(32)
-    private val speedRunnable = Runnable { tickSpeed() }
+    private val upSamples = ArrayDeque<Float>(60)
+    private val downSamples = ArrayDeque<Float>(60)
+    private var lastUpBytes = 0L
+    private var lastDownBytes = 0L
+    private val speedRunnable = Runnable { tickStats() }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -128,7 +131,7 @@ class MainActivity : Activity() {
             setPadding(0, dp(6), 0, dp(10))
             elevation = 12f
         }
-        listOf("Home", "Configs", "Speed", "Logs", "Settings").forEachIndexed { i, label ->
+        listOf("Home", "Configs", "Stats", "Logs", "More").forEachIndexed { i, label ->
             val tv = TextView(this).apply {
                 text = label
                 textSize = 11f
@@ -392,44 +395,109 @@ class MainActivity : Activity() {
     }
 
     private fun buildSpeedTab(): LinearLayout {
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setBackgroundColor(BG); setPadding(dp(16), dp(20), dp(16), dp(12)) }
-        col.addView(TextView(this).apply { text = "Live speed"; textSize = 18f; setTextColor(TEXT); typeface = Typeface.DEFAULT_BOLD })
-        col.addView(TextView(this).apply { text = "Updates only while this tab is open and connected."; textSize = 12f; setTextColor(MUTED); setPadding(0, dp(4), 0, dp(12)) })
-        spark = SparklineView(this)
-        col.addView(spark, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(160)).apply { bottomMargin = dp(16) })
-        tvSpeedDown = TextView(this).apply { text = "Download: —"; textSize = 16f; setTextColor(SUCCESS); setPadding(0, dp(4), 0, dp(4)) }
-        tvSpeedUp = TextView(this).apply { text = "Upload: —"; textSize = 16f; setTextColor(ACCENT); setPadding(0, dp(4), 0, dp(4)) }
-        tvSpeedLat = TextView(this).apply { text = "Latency: —"; textSize = 14f; setTextColor(MUTED); setPadding(0, dp(4), 0, dp(4)) }
-        col.addView(tvSpeedDown); col.addView(tvSpeedUp); col.addView(tvSpeedLat)
-        return col
+        val scroll = ScrollView(this).apply { setBackgroundColor(BG) }
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(20), dp(16), dp(16))
+        }
+        col.addView(TextView(this).apply {
+            text = "Stats"
+            textSize = 20f
+            setTextColor(TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(16))
+        })
+
+        val upHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        upHeader.addView(TextView(this).apply {
+            text = "Uplink"
+            textSize = 14f
+            setTextColor(MUTED)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        tvUplinkTotal = TextView(this).apply {
+            text = "0 B"
+            textSize = 14f
+            setTextColor(TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        upHeader.addView(tvUplinkTotal)
+        col.addView(upHeader)
+        chartUp = TrafficChartView(this, Color.parseColor("#F59E0B"))
+        col.addView(chartUp, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(120)
+        ).apply { topMargin = dp(6); bottomMargin = dp(20) })
+
+        val downHeader = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        downHeader.addView(TextView(this).apply {
+            text = "Downlink"
+            textSize = 14f
+            setTextColor(MUTED)
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+        })
+        tvDownlinkTotal = TextView(this).apply {
+            text = "0 B"
+            textSize = 14f
+            setTextColor(TEXT)
+            typeface = Typeface.DEFAULT_BOLD
+        }
+        downHeader.addView(tvDownlinkTotal)
+        col.addView(downHeader)
+        chartDown = TrafficChartView(this, Color.parseColor("#F59E0B"))
+        col.addView(chartDown, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, dp(120)
+        ).apply { topMargin = dp(6); bottomMargin = dp(12) })
+
+        col.addView(TextView(this).apply {
+            text = "Charts update while this tab is open. Connect first to see traffic."
+            textSize = 12f
+            setTextColor(MUTED)
+            setPadding(0, dp(8), 0, 0)
+        })
+        scroll.addView(col)
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(scroll, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.MATCH_PARENT,
+            ))
+        }
     }
 
-    private fun startSpeedMonitor() { if (speedRunning) return; speedRunning = true; speedSamples.clear(); spark.setSamples(emptyList()); tickSpeed() }
-    private fun stopSpeedMonitor() { speedRunning = false; mainHandler.removeCallbacks(speedRunnable) }
+    private fun startSpeedMonitor() {
+        if (speedRunning) return
+        speedRunning = true
+        upSamples.clear()
+        downSamples.clear()
+        lastUpBytes = TunnelStats.uplink.get()
+        lastDownBytes = TunnelStats.downlink.get()
+        chartUp.setSamples(emptyList())
+        chartDown.setSamples(emptyList())
+        tickStats()
+    }
 
-    private fun tickSpeed() {
+    private fun stopSpeedMonitor() {
+        speedRunning = false
+        mainHandler.removeCallbacks(speedRunnable)
+    }
+
+    private fun tickStats() {
         if (!speedRunning || currentTab != 2) return
-        if (VpnState.status != Status.CONNECTED || VpnState.socksPort <= 0) {
-            tvSpeedDown.text = "Download: — (connect first)"; tvSpeedUp.text = "Upload: —"; tvSpeedLat.text = "Latency: —"
-            mainHandler.postDelayed(speedRunnable, 2000); return
-        }
-        val port = VpnState.socksPort
-        Thread {
-            val r = SpeedTest.run(port, downloadBytes = 400_000, uploadBytes = 200_000)
-            mainHandler.post {
-                if (!speedRunning) return@post
-                if (r.error != null) tvSpeedLat.text = "Sample failed: ${r.error}"
-                else {
-                    val down = r.downloadMbps.toFloat().coerceAtLeast(0f)
-                    if (speedSamples.size >= 30) speedSamples.removeFirst()
-                    speedSamples.addLast(down); spark.setSamples(speedSamples.toList())
-                    tvSpeedDown.text = "Download: ${r.downloadMbps} Mbps"
-                    tvSpeedUp.text = "Upload: ${r.uploadMbps} Mbps"
-                    tvSpeedLat.text = "Latency: ${r.latencyMs} ms"
-                }
-                mainHandler.postDelayed(speedRunnable, 2500)
-            }
-        }.start()
+        val up = TunnelStats.uplink.get()
+        val down = TunnelStats.downlink.get()
+        val dUp = (up - lastUpBytes).coerceAtLeast(0).toFloat()
+        val dDown = (down - lastDownBytes).coerceAtLeast(0).toFloat()
+        lastUpBytes = up
+        lastDownBytes = down
+        if (upSamples.size >= 60) upSamples.removeFirst()
+        if (downSamples.size >= 60) downSamples.removeFirst()
+        upSamples.addLast(dUp)
+        downSamples.addLast(dDown)
+        chartUp.setSamples(upSamples.toList())
+        chartDown.setSamples(downSamples.toList())
+        tvUplinkTotal.text = TunnelStats.formatBytes(up)
+        tvDownlinkTotal.text = TunnelStats.formatBytes(down)
+        mainHandler.postDelayed(speedRunnable, 1000)
     }
 
     private fun buildLogsTab(): LinearLayout {
@@ -472,7 +540,7 @@ class MainActivity : Activity() {
         })
         col.addView(TextView(this).apply { text = "Contact"; textSize = 16f; setTextColor(TEXT); typeface = Typeface.DEFAULT_BOLD; setPadding(0, dp(24), 0, dp(8)) })
         col.addView(TextView(this).apply { text = "Telegram bot link will be added here later."; textSize = 13f; setTextColor(MUTED) })
-        col.addView(TextView(this).apply { text = "Karoon Tunnel · v1.6"; textSize = 12f; setTextColor(MUTED); gravity = Gravity.CENTER; setPadding(0, dp(32), 0, 0) })
+        col.addView(TextView(this).apply { text = "Karoon Tunnel · v1.7"; textSize = 12f; setTextColor(MUTED); gravity = Gravity.CENTER; setPadding(0, dp(32), 0, 0) })
         scroll.addView(col)
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -536,20 +604,52 @@ class MainActivity : Activity() {
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
 }
 
-class SparklineView(ctx: Context) : View(ctx) {
+/** Line chart for live traffic rate (bytes per second samples). */
+class TrafficChartView(ctx: Context, private val lineColor: Int) : View(ctx) {
     private var samples: List<Float> = emptyList()
-    private val barPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#3B82F6"); style = Paint.Style.FILL }
-    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#1A2332"); style = Paint.Style.FILL }
-    fun setSamples(s: List<Float>) { samples = s; invalidate() }
+    private val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = lineColor
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        strokeJoin = Paint.Join.ROUND
+        strokeCap = Paint.Cap.ROUND
+    }
+    private val gridPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#334155")
+        strokeWidth = 1f
+    }
+    private val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#1A2332")
+        style = Paint.Style.FILL
+    }
+
+    fun setSamples(s: List<Float>) {
+        samples = s
+        invalidate()
+    }
+
     override fun onDraw(canvas: Canvas) {
-        val w = width.toFloat(); val h = height.toFloat()
-        canvas.drawRoundRect(0f, 0f, w, h, 24f, 24f, bgPaint)
-        if (samples.isEmpty()) return
-        val maxV = max(samples.maxOrNull() ?: 1f, 0.1f); val n = samples.size; val gap = 4f; val barW = (w - gap * (n + 1)) / n
-        samples.forEachIndexed { i, v ->
-            val bh = (v / maxV) * (h * 0.85f); val left = gap + i * (barW + gap); val top = h - bh - 8f
-            barPaint.color = when { v < 1f -> Color.parseColor("#F59E0B"); v < 5f -> Color.parseColor("#3B82F6"); else -> Color.parseColor("#22C55E") }
-            canvas.drawRoundRect(left, top, left + barW, h - 8f, 6f, 6f, barPaint)
+        val w = width.toFloat()
+        val h = height.toFloat()
+        canvas.drawRoundRect(0f, 0f, w, h, 16f, 16f, bgPaint)
+        val rows = 6
+        for (i in 0..rows) {
+            val y = h * i / rows
+            canvas.drawLine(8f, y, w - 8f, y, gridPaint)
         }
+        val cols = 10
+        for (i in 0..cols) {
+            val x = w * i / cols
+            canvas.drawLine(x, 0f, x, h, gridPaint)
+        }
+        if (samples.size < 2) return
+        val maxV = max(samples.maxOrNull() ?: 1f, 1f)
+        val path = android.graphics.Path()
+        samples.forEachIndexed { i, v ->
+            val x = i.toFloat() / (samples.size - 1).coerceAtLeast(1) * (w - 16f) + 8f
+            val y = h - (v / maxV) * (h * 0.85f) - 8f
+            if (i == 0) path.moveTo(x, y) else path.lineTo(x, y)
+        }
+        canvas.drawPath(path, linePaint)
     }
 }
