@@ -17,26 +17,25 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * SOCKS5 on 127.0.0.1 — CONNECT via SSH direct-tcpip.
- * Host-level fail backoff avoids burning slots on blocked destinations.
+ * Higher parallel opens (16) to approach commercial clients like Npv on same panel.
  */
 class Socks5Server(
     private val sessionProvider: () -> Session?,
-    maxChannels: Int = 32,
+    maxChannels: Int = 48,
     private val udpgw: UdpgwClient? = null,
 ) {
 
     companion object {
         private const val FAIL_LOG_INTERVAL_MS = 8_000L
-        private const val MAX_OPENS_IN_FLIGHT = 8
+        private const val MAX_OPENS_IN_FLIGHT = 16
         private const val PUBLIC_DNS = "1.1.1.1"
-        private const val DATA_IDLE_TIMEOUT_MS = 120_000
+        private const val DATA_IDLE_TIMEOUT_MS = 180_000
         private const val BUF = 64 * 1024
-        /** After channel-not-opened, skip this host for a while. */
-        private const val HOST_BACKOFF_MS = 25_000L
+        private const val HOST_BACKOFF_MS = 20_000L
     }
 
     private val limit = maxChannels.coerceIn(8, 64)
-    private val poolSize = (limit + 8).coerceIn(16, 48)
+    private val poolSize = (limit + 16).coerceIn(24, 64)
     private val pool = Executors.newFixedThreadPool(poolSize)
     private val gate = Semaphore(limit)
     private val openGate = Semaphore(MAX_OPENS_IN_FLIGHT)
@@ -57,13 +56,13 @@ class Socks5Server(
         val s = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
-        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT (balanced)")
+        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT (npv-parity)")
         pool.execute {
             while (running) {
                 try {
                     val c = s.accept()
                     c.tcpNoDelay = true
-                    if (!gate.tryAcquire(4, TimeUnit.SECONDS)) {
+                    if (!gate.tryAcquire(3, TimeUnit.SECONDS)) {
                         try { c.close() } catch (_: Exception) {}
                         continue
                     }
@@ -93,7 +92,7 @@ class Socks5Server(
         var channel: ChannelDirectTCPIP? = null
         var counted = false
         try {
-            client.soTimeout = 18_000
+            client.soTimeout = 15_000
             val cin = DataInputStream(client.getInputStream())
             val cout = client.getOutputStream()
 
@@ -223,11 +222,12 @@ class Socks5Server(
     }
 
     private fun openDirectChannel(session: Session, host: String, port: Int): ChannelDirectTCPIP? {
-        if (!openGate.tryAcquire(6, TimeUnit.SECONDS)) return null
+        if (!openGate.tryAcquire(8, TimeUnit.SECONDS)) return null
         try {
             repeat(2) { attempt ->
                 if (!session.isConnected) return null
                 try {
+                    // Only openChannel needs the session lock; connect runs outside.
                     val ch = synchronized(openLock) {
                         val c = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
                         c.setHost(host)
@@ -236,11 +236,11 @@ class Socks5Server(
                         c.setOrgPort(0)
                         c
                     }
-                    ch.connect(12_000)
+                    ch.connect(10_000)
                     if (ch.isConnected) return ch
                     try { ch.disconnect() } catch (_: Exception) {}
                 } catch (_: Exception) {
-                    try { Thread.sleep(60L * (attempt + 1)) } catch (_: InterruptedException) { return null }
+                    try { Thread.sleep(40L * (attempt + 1)) } catch (_: InterruptedException) { return null }
                 }
             }
             return null
