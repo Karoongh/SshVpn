@@ -26,6 +26,7 @@ class SshVpnService : VpnService() {
         private const val CHANNEL_ID = "karoon_vpn"
         private const val NOTIF_ID = 1
         private const val MTU = 1280
+        private const val SSH_CONNECT_ATTEMPTS = 3
     }
 
     private var worker: Thread? = null
@@ -78,7 +79,7 @@ class SshVpnService : VpnService() {
         try {
             VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
             LogStore.append("Connecting SSH (before VPN) to ${cfg.host}:${cfg.port}")
-            val s = connectSsh(cfg)
+            val s = connectSshWithRetry(cfg)
             if (stopping) return
             session = s
             LogStore.append("SSH session established")
@@ -158,7 +159,6 @@ class SshVpnService : VpnService() {
                 if (stopping) break
                 val sess = session
                 if (sess == null || !sess.isConnected) {
-                    // Only real drops — ignore after user pressed Disconnect
                     if (!stopping) {
                         shutdown("SSH connection lost", Status.ERROR)
                     }
@@ -183,7 +183,35 @@ class SshVpnService : VpnService() {
         }
     }
 
-    private fun connectSsh(cfg: SshConfig): Session {
+    /** Retry transient handshake drops common on shared SSH panels. */
+    private fun connectSshWithRetry(cfg: SshConfig): Session {
+        var last: Throwable? = null
+        for (attempt in 1..SSH_CONNECT_ATTEMPTS) {
+            if (stopping) throw InterruptedException("stopped")
+            try {
+                if (attempt > 1) {
+                    LogStore.append("SSH retry $attempt/$SSH_CONNECT_ATTEMPTS ...")
+                    VpnState.update(Status.CONNECTING, "SSH retry $attempt/$SSH_CONNECT_ATTEMPTS ...")
+                    Thread.sleep(1200L * attempt)
+                }
+                return connectSshOnce(cfg)
+            } catch (t: Throwable) {
+                last = t
+                val m = t.message ?: ""
+                val transient = m.contains("End of IO Stream", true) ||
+                    m.contains("Connection reset", true) ||
+                    m.contains("Broken pipe", true) ||
+                    m.contains("timed out", true) ||
+                    m.contains("timeout", true) ||
+                    m.contains("Connection refused", true)
+                LogStore.append("SSH attempt $attempt failed: ${t.javaClass.simpleName}: ${t.message}")
+                if (!transient || attempt == SSH_CONNECT_ATTEMPTS) break
+            }
+        }
+        throw last ?: IllegalStateException("SSH connect failed")
+    }
+
+    private fun connectSshOnce(cfg: SshConfig): Session {
         val jsch = JSch()
         if (cfg.privateKey.isNotBlank()) {
             jsch.addIdentity(
@@ -242,6 +270,8 @@ class SshVpnService : VpnService() {
         return when {
             m.contains("Auth fail", true) || m.contains("authentication failed", true) ->
                 "SSH authentication failed; check username, password, or private key. Details: $m"
+            m.contains("End of IO Stream", true) || m.contains("Connection reset", true) ->
+                "Server closed the connection during handshake. Often: account already has 2 sessions, server overload, or network block. Try again or disconnect other devices. Details: $m"
             m.contains("timeout", true) || m.contains("timed out", true) ->
                 "SSH connection timed out; check host, port, and network. Details: $m"
             m.contains("refused", true) ->
@@ -259,7 +289,6 @@ class SshVpnService : VpnService() {
     @Synchronized
     private fun shutdown(message: String, status: Status) {
         if (stopping && status == Status.ERROR) {
-            // Already shutting down intentionally — do not overwrite with ERROR
             return
         }
         stopping = true
