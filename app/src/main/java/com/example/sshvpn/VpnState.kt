@@ -3,7 +3,7 @@ package com.example.sshvpn
 import android.os.Handler
 import android.os.Looper
 
-enum class Status { DISCONNECTED, CONNECTING, CONNECTED, ERROR }
+enum class Status { DISCONNECTED, CONNECTING, RECONNECTING, CONNECTED, ERROR }
 
 /** Tiny in-process state holder shared by the service and the activity. */
 object VpnState {
@@ -20,7 +20,7 @@ object VpnState {
     fun update(status: Status, message: String = "") {
         this.status = status
         this.message = message
-        if (status != Status.CONNECTED && status != Status.CONNECTING) {
+        if (status != Status.CONNECTED && status != Status.CONNECTING && status != Status.RECONNECTING) {
             socksPort = -1
         }
         if (message.isNotBlank()) {
