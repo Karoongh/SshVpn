@@ -4,8 +4,13 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
@@ -16,6 +21,7 @@ import com.jcraft.jsch.UIKeyboardInteractive
 import com.jcraft.jsch.UserInfo
 import hev.htproxy.TProxyService
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 class SshVpnService : VpnService() {
 
@@ -27,20 +33,30 @@ class SshVpnService : VpnService() {
         private const val NOTIF_ID = 1
         private const val MTU = 1280
         private const val SSH_CONNECT_ATTEMPTS = 3
+        private const val MAX_RECONNECT_ROUNDS = 8
     }
 
     private var worker: Thread? = null
     private var session: Session? = null
     private var socks: Socks5Server? = null
     private var tun: ParcelFileDescriptor? = null
+    private var activeConfig: SshConfig? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** User pressed Disconnect — do not auto-reconnect. */
+    private val userStop = AtomicBoolean(false)
 
     @Volatile
     private var stopping = false
+
+    /** Set when network becomes available while waiting to reconnect. */
+    private val networkAvailable = AtomicBoolean(true)
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         try {
             when (intent?.action) {
                 ACTION_STOP -> {
+                    userStop.set(true)
                     shutdown("Disconnected", Status.DISCONNECTED)
                     return START_NOT_STICKY
                 }
@@ -54,11 +70,14 @@ class SshVpnService : VpnService() {
                     if (worker?.isAlive == true) return START_NOT_STICKY
                     startForegroundCompat("Connecting...")
                     stopping = false
+                    userStop.set(false)
+                    activeConfig = cfg
+                    registerNetworkCallback()
                     worker = Thread({
                         try {
-                            runTunnel(cfg)
+                            runTunnelLoop(cfg)
                         } catch (t: Throwable) {
-                            if (!stopping) {
+                            if (!stopping && !userStop.get()) {
                                 LogStore.append("Worker crashed: ${t.javaClass.simpleName}: ${t.message}")
                                 shutdown("Worker crashed: ${t.message}", Status.ERROR)
                             }
@@ -74,20 +93,70 @@ class SshVpnService : VpnService() {
         return START_NOT_STICKY
     }
 
-    private fun runTunnel(cfg: SshConfig) {
+    /**
+     * Outer loop: establish tunnel, monitor, on unexpected drop reset and reconnect
+     * until user stops or rounds exhausted.
+     */
+    private fun runTunnelLoop(cfg: SshConfig) {
+        var round = 0
+        while (!stopping && !userStop.get()) {
+            try {
+                if (round > 0) {
+                    VpnState.update(Status.RECONNECTING, "Reconnecting ($round/$MAX_RECONNECT_ROUNDS) ...")
+                    updateNotification("Reconnecting ($round/$MAX_RECONNECT_ROUNDS)...")
+                    LogStore.append("Auto-reconnect round $round — resetting session")
+                    teardownSessionOnly()
+                    waitForNetworkOrStop()
+                    if (stopping || userStop.get()) break
+                    Thread.sleep((1500L * round.coerceAtMost(5)).coerceAtMost(8000L))
+                }
+                val ok = establishAndMonitor(cfg, isReconnect = round > 0)
+                if (ok) {
+                    // User stopped cleanly from inside monitor
+                    break
+                }
+                // Unexpected drop
+                round++
+                if (round > MAX_RECONNECT_ROUNDS) {
+                    if (!userStop.get()) {
+                        shutdown("Reconnect failed after $MAX_RECONNECT_ROUNDS tries", Status.ERROR)
+                    }
+                    return
+                }
+            } catch (e: InterruptedException) {
+                break
+            } catch (t: Throwable) {
+                if (userStop.get() || stopping) break
+                LogStore.append("Tunnel error: ${describeThrowable(t)}")
+                round++
+                if (round > MAX_RECONNECT_ROUNDS) {
+                    shutdown(describeThrowable(t), Status.ERROR)
+                    return
+                }
+            }
+        }
+        if (userStop.get() || stopping) {
+            // shutdown already called from ACTION_STOP or will be
+            if (!stopping) shutdown("Disconnected", Status.DISCONNECTED)
+        }
+    }
+
+    /** @return true if exited because user stopped; false if connection dropped. */
+    private fun establishAndMonitor(cfg: SshConfig, isReconnect: Boolean): Boolean {
         var stage = "SSH connection"
         try {
-            VpnState.update(Status.CONNECTING, "SSH ${cfg.host}:${cfg.port} ...")
+            val statusLabel = if (isReconnect) Status.RECONNECTING else Status.CONNECTING
+            VpnState.update(statusLabel, "SSH ${cfg.host}:${cfg.port} ...")
             LogStore.append("Connecting SSH (before VPN) to ${cfg.host}:${cfg.port}")
             val s = connectSshWithRetry(cfg)
-            if (stopping) return
+            if (stopping || userStop.get()) return true
             session = s
             LogStore.append("SSH session established")
 
             val channels = cfg.maxChannels.coerceIn(8, 64)
 
             stage = "Starting local SOCKS5 proxy"
-            VpnState.update(Status.CONNECTING, "Starting local proxy ...")
+            VpnState.update(statusLabel, "Starting local proxy ...")
             val server = Socks5Server({ session }, channels, udpgw = null)
             server.start()
             socks = server
@@ -95,7 +164,7 @@ class SshVpnService : VpnService() {
             LogStore.append("Local SOCKS5 on port ${server.port} (tcp relay, maxChannels=$channels)")
 
             stage = "Creating Android VPN interface"
-            VpnState.update(Status.CONNECTING, "Starting Android VPN ...")
+            VpnState.update(statusLabel, "Starting Android VPN ...")
             val builder = Builder()
                 .setSession(cfg.name.ifBlank { "Karoon Tunnel" })
                 .setMtu(MTU)
@@ -122,7 +191,7 @@ class SshVpnService : VpnService() {
             LogStore.append("VPN interface established (MTU=$MTU)")
 
             stage = "Starting traffic tunnel (hev-socks5-tunnel)"
-            VpnState.update(Status.CONNECTING, "Starting traffic tunnel ...")
+            VpnState.update(statusLabel, "Starting traffic tunnel ...")
             if (!TProxyService.nativeReady) {
                 throw IllegalStateException("Native library hev-socks5-tunnel failed to load on this device")
             }
@@ -154,44 +223,115 @@ class SshVpnService : VpnService() {
             VpnState.update(Status.CONNECTED, "Connected to ${cfg.host}")
             updateNotification("Connected to ${cfg.host}")
 
-            while (!stopping) {
+            while (!stopping && !userStop.get()) {
                 Thread.sleep(1500)
-                if (stopping) break
+                if (stopping || userStop.get()) return true
                 val sess = session
                 if (sess == null || !sess.isConnected) {
-                    if (!stopping) {
-                        shutdown("SSH connection lost", Status.ERROR)
-                    }
-                    return
+                    LogStore.append("SSH session dropped — will reconnect")
+                    return false
                 }
                 try {
                     sess.sendKeepAliveMsg()
                 } catch (_: Exception) {
-                    if (!stopping && session?.isConnected != true) {
-                        shutdown("SSH connection lost", Status.ERROR)
-                        return
+                    if (session?.isConnected != true) {
+                        LogStore.append("SSH keepalive failed — will reconnect")
+                        return false
                     }
                 }
             }
+            return true
         } catch (e: InterruptedException) {
+            return true
         } catch (t: Throwable) {
-            if (!stopping) {
-                val msg = "$stage failed: ${describeThrowable(t)}"
-                LogStore.append(msg)
-                shutdown(msg, Status.ERROR)
-            }
+            if (userStop.get() || stopping) return true
+            LogStore.append("$stage failed: ${describeThrowable(t)}")
+            return false
         }
     }
 
-    /** Retry transient handshake drops common on shared SSH panels. */
+    private fun waitForNetworkOrStop() {
+        var waited = 0
+        while (!networkAvailable.get() && !stopping && !userStop.get() && waited < 120_000) {
+            VpnState.update(Status.RECONNECTING, "Waiting for network ...")
+            Thread.sleep(1000)
+            waited += 1000
+        }
+    }
+
+    /** Tear down tunnel pieces without stopping the service (for reconnect). */
+    private fun teardownSessionOnly() {
+        try {
+            if (TProxyService.nativeReady) TProxyService.TProxyStopService()
+        } catch (_: Throwable) {}
+        try { socks?.stop() } catch (_: Exception) {}
+        socks = null
+        VpnState.socksPort = -1
+        try { session?.disconnect() } catch (_: Exception) {}
+        session = null
+        try { tun?.close() } catch (_: Exception) {}
+        tun = null
+    }
+
+    private fun registerNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            networkCallback?.let {
+                try { cm.unregisterNetworkCallback(it) } catch (_: Exception) {}
+            }
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    networkAvailable.set(true)
+                    LogStore.append("Network available")
+                }
+
+                override fun onLost(network: Network) {
+                    // Only mark unavailable if no other validated network remains
+                    val active = cm.activeNetwork
+                    val caps = active?.let { cm.getNetworkCapabilities(it) }
+                    val stillUp = caps != null && (
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                    )
+                    networkAvailable.set(stillUp)
+                    if (!stillUp) LogStore.append("Network lost")
+                }
+            }
+            networkCallback = cb
+            val req = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(req, cb)
+            // Seed current state
+            val active = cm.activeNetwork
+            val caps = active?.let { cm.getNetworkCapabilities(it) }
+            networkAvailable.set(
+                caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            )
+        } catch (e: Exception) {
+            LogStore.append("Network callback setup failed: ${e.message}")
+            networkAvailable.set(true)
+        }
+    }
+
+    private fun unregisterNetworkCallback() {
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            networkCallback?.let { cm.unregisterNetworkCallback(it) }
+        } catch (_: Exception) {}
+        networkCallback = null
+    }
+
     private fun connectSshWithRetry(cfg: SshConfig): Session {
         var last: Throwable? = null
         for (attempt in 1..SSH_CONNECT_ATTEMPTS) {
-            if (stopping) throw InterruptedException("stopped")
+            if (stopping || userStop.get()) throw InterruptedException("stopped")
             try {
                 if (attempt > 1) {
                     LogStore.append("SSH retry $attempt/$SSH_CONNECT_ATTEMPTS ...")
-                    VpnState.update(Status.CONNECTING, "SSH retry $attempt/$SSH_CONNECT_ATTEMPTS ...")
+                    VpnState.update(
+                        if (VpnState.status == Status.RECONNECTING) Status.RECONNECTING else Status.CONNECTING,
+                        "SSH retry $attempt/$SSH_CONNECT_ATTEMPTS ...",
+                    )
                     Thread.sleep(1200L * attempt)
                 }
                 return connectSshOnce(cfg)
@@ -241,9 +381,6 @@ class SshVpnService : VpnService() {
                 prompt: Array<out String>?,
                 echo: BooleanArray?,
             ): Array<String>? {
-                LogStore.append(
-                    "keyboard-interactive prompt: ${prompt?.joinToString() ?: "(none)"}"
-                )
                 if (prompt.isNullOrEmpty()) return emptyArray()
                 return Array(prompt.size) { cfg.password }
             }
@@ -292,27 +429,25 @@ class SshVpnService : VpnService() {
             return
         }
         stopping = true
-        try {
-            if (TProxyService.nativeReady) TProxyService.TProxyStopService()
-        } catch (_: Throwable) {}
-        try { socks?.stop() } catch (_: Exception) {}
-        socks = null
-        VpnState.socksPort = -1
-        try { session?.disconnect() } catch (_: Exception) {}
-        session = null
-        try { tun?.close() } catch (_: Exception) {}
-        tun = null
+        userStop.set(status == Status.DISCONNECTED || userStop.get())
+        unregisterNetworkCallback()
+        teardownSessionOnly()
+        activeConfig = null
         VpnState.update(status, message)
         try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Exception) {}
         stopSelf()
     }
 
     override fun onRevoke() {
+        userStop.set(true)
         shutdown("VPN permission revoked", Status.DISCONNECTED)
     }
 
     override fun onDestroy() {
-        if (!stopping) shutdown("Disconnected", Status.DISCONNECTED)
+        if (!stopping) {
+            userStop.set(true)
+            shutdown("Disconnected", Status.DISCONNECTED)
+        }
         super.onDestroy()
     }
 
