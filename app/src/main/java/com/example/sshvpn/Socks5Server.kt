@@ -14,24 +14,25 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * SOCKS5 on 127.0.0.1 — CONNECT via SSH direct-tcpip, optional UDP ASSOCIATE via UDPGW.
+ * SOCKS5 on 127.0.0.1 — CONNECT via SSH direct-tcpip.
+ * Tuned for shared SSH panels (low MaxSessions / channel pressure).
  */
 class Socks5Server(
     private val sessionProvider: () -> Session?,
-    maxChannels: Int = 48,
+    maxChannels: Int = 32,
     private val udpgw: UdpgwClient? = null,
 ) {
 
     companion object {
-        private const val FAIL_LOG_INTERVAL_MS = 4_000L
-        private const val MAX_OPENS_IN_FLIGHT = 12
+        private const val FAIL_LOG_INTERVAL_MS = 5_000L
+        /** Keep concurrent channel opens low — panel servers choke above ~4–6. */
+        private const val MAX_OPENS_IN_FLIGHT = 4
         private const val PUBLIC_DNS = "1.1.1.1"
-        /** Drop idle data sockets so stuck video channels free the gate. */
-        private const val DATA_IDLE_TIMEOUT_MS = 120_000
+        private const val DATA_IDLE_TIMEOUT_MS = 90_000
     }
 
-    private val limit = maxChannels.coerceIn(8, 128)
-    private val poolSize = 32.coerceAtMost(limit + 8)
+    private val limit = maxChannels.coerceIn(8, 64)
+    private val poolSize = 24.coerceAtMost(limit + 4)
     private val pool = Executors.newFixedThreadPool(poolSize)
     private val gate = Semaphore(limit)
     private val openGate = Semaphore(MAX_OPENS_IN_FLIGHT)
@@ -48,18 +49,16 @@ class Socks5Server(
     val port: Int get() = server?.localPort ?: -1
 
     fun start() {
-        val s = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
+        val s = ServerSocket(0, 256, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
-        val udpInfo = if (udpgw != null && udpgw.localRelayPort > 0) " udpRelay=${udpgw.localRelayPort}" else " udp=tcp-fallback"
-        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT$udpInfo")
+        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT (stable mode)")
         pool.execute {
             while (running) {
                 try {
                     val c = s.accept()
                     c.tcpNoDelay = true
-                    // Wait a few seconds for a free slot (helps speed test under load)
-                    if (!gate.tryAcquire(4, TimeUnit.SECONDS)) {
+                    if (!gate.tryAcquire(6, TimeUnit.SECONDS)) {
                         try { c.close() } catch (_: Exception) {}
                         continue
                     }
@@ -70,7 +69,7 @@ class Socks5Server(
                             gate.release()
                         }
                     }
-                } catch (e: Exception) {
+                } catch (_: Exception) {
                     if (running) continue else break
                 }
             }
@@ -88,7 +87,7 @@ class Socks5Server(
         var channel: ChannelDirectTCPIP? = null
         var counted = false
         try {
-            client.soTimeout = 20_000 // handshake must be quick
+            client.soTimeout = 25_000
             val cin = DataInputStream(client.getInputStream())
             val cout = client.getOutputStream()
 
@@ -105,24 +104,8 @@ class Socks5Server(
 
             if (cmd == 3) {
                 skipAddr(cin, atyp)
-                val relay = udpgw?.localRelayPort ?: -1
-                if (relay <= 0) {
-                    reply(cout, 7)
-                    return
-                }
-                val rp = relay
-                cout.write(
-                    byteArrayOf(
-                        5, 0, 0, 1,
-                        127, 0, 0, 1,
-                        (rp shr 8).toByte(), (rp and 0xff).toByte(),
-                    )
-                )
-                cout.flush()
-                client.soTimeout = 0
-                try {
-                    while (client.getInputStream().read() >= 0) { /* hold */ }
-                } catch (_: Exception) {}
+                // No real UDP path — reject UDP ASSOCIATE cleanly (apps fall back to TCP)
+                reply(cout, 7)
                 return
             }
 
@@ -161,11 +144,10 @@ class Socks5Server(
             counted = true
             active.incrementAndGet()
             val n = okCount.incrementAndGet()
-            if (n <= 3 || n % 50 == 0) {
+            if (n <= 5 || n % 40 == 0) {
                 LogStore.append("SOCKS ok $host:$port active=${active.get()}/$limit")
             }
 
-            // Idle timeout frees slots when a video stream stalls
             client.soTimeout = DATA_IDLE_TIMEOUT_MS
 
             val rin = ch.inputStream
@@ -212,23 +194,27 @@ class Socks5Server(
     }
 
     private fun rewriteDestination(host: String, port: Int): Pair<String, Int> {
-        if (host.startsWith("198.18.") && (port == 53 || port == 853 || port == 443 || port == 784 || port == 8853)) {
-            return PUBLIC_DNS to if (port == 443 || port == 53) port else 853
+        // Fake-IP / poison ranges → real public DNS
+        if (host.startsWith("198.18.") || host.startsWith("10.10.34.")) {
+            return PUBLIC_DNS to when (port) {
+                53 -> 53
+                853, 443, 784, 8853 -> 853
+                else -> 53
+            }
         }
         return host to port
     }
 
     private fun shouldReject(host: String): Boolean {
         if (host == "127.0.0.1" || host == "0.0.0.0" || host == "::1") return true
-        if (host.startsWith("198.18.")) return true
-        if (host.startsWith("10.10.34.")) return true
         return false
     }
 
     private fun openDirectChannel(session: Session, host: String, port: Int): ChannelDirectTCPIP? {
-        if (!openGate.tryAcquire(8, TimeUnit.SECONDS)) return null
+        if (!openGate.tryAcquire(12, TimeUnit.SECONDS)) return null
         try {
-            repeat(3) { attempt ->
+            repeat(4) { attempt ->
+                if (!session.isConnected) return null
                 try {
                     val ch = synchronized(openLock) {
                         val c = session.openChannel("direct-tcpip") as ChannelDirectTCPIP
@@ -238,10 +224,18 @@ class Socks5Server(
                         c.setOrgPort(0)
                         c
                     }
-                    ch.connect(12_000)
-                    return ch
-                } catch (_: Exception) {
-                    try { Thread.sleep(60L * (attempt + 1)) } catch (_: InterruptedException) { return null }
+                    ch.connect(18_000)
+                    if (ch.isConnected) return ch
+                    try { ch.disconnect() } catch (_: Exception) {}
+                } catch (e: Exception) {
+                    val msg = e.message ?: ""
+                    // Brief pause; longer after channel-not-opened
+                    val delay = if (msg.contains("channel is not opened", true)) {
+                        200L * (attempt + 1)
+                    } else {
+                        80L * (attempt + 1)
+                    }
+                    try { Thread.sleep(delay) } catch (_: InterruptedException) { return null }
                 }
             }
             return null
@@ -266,7 +260,7 @@ class Socks5Server(
     }
 
     private fun pump(src: InputStream, dst: OutputStream) {
-        val buf = ByteArray(64 * 1024)
+        val buf = ByteArray(32 * 1024)
         try {
             while (true) {
                 val n = src.read(buf)
