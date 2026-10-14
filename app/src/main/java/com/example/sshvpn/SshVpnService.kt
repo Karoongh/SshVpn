@@ -148,6 +148,7 @@ class SshVpnService : VpnService() {
             val server = Socks5Server({ session }, channels, udpgw = null)
             server.start()
             socks = server
+            TunnelStats.reset()
             VpnState.socksPort = server.port
             LogStore.append("Local SOCKS5 on port ${server.port} (tcp relay, maxChannels=$channels)")
 
