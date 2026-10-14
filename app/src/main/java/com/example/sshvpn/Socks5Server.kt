@@ -12,10 +12,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * SOCKS5 on 127.0.0.1 — CONNECT via SSH direct-tcpip.
- * Tuned for shared SSH panels (low MaxSessions / channel pressure).
+ * Counts bytes for TunnelStats (Stats tab charts).
  */
 class Socks5Server(
     private val sessionProvider: () -> Session?,
@@ -25,7 +26,6 @@ class Socks5Server(
 
     companion object {
         private const val FAIL_LOG_INTERVAL_MS = 5_000L
-        /** Keep concurrent channel opens low — panel servers choke above ~4–6. */
         private const val MAX_OPENS_IN_FLIGHT = 4
         private const val PUBLIC_DNS = "1.1.1.1"
         private const val DATA_IDLE_TIMEOUT_MS = 90_000
@@ -104,7 +104,6 @@ class Socks5Server(
 
             if (cmd == 3) {
                 skipAddr(cin, atyp)
-                // No real UDP path — reject UDP ASSOCIATE cleanly (apps fall back to TCP)
                 reply(cout, 7)
                 return
             }
@@ -152,8 +151,9 @@ class Socks5Server(
 
             val rin = ch.inputStream
             val rout = ch.outputStream
-            val t = Thread { pump(rin, cout) }.also { it.isDaemon = true; it.start() }
-            pump(cin, rout)
+            // downlink = remote -> phone; uplink = phone -> remote
+            val t = Thread { pump(rin, cout, TunnelStats.downlink) }.also { it.isDaemon = true; it.start() }
+            pump(cin, rout, TunnelStats.uplink)
             t.join(2_000)
         } catch (_: Exception) {
         } finally {
@@ -194,7 +194,6 @@ class Socks5Server(
     }
 
     private fun rewriteDestination(host: String, port: Int): Pair<String, Int> {
-        // Fake-IP / poison ranges → real public DNS
         if (host.startsWith("198.18.") || host.startsWith("10.10.34.")) {
             return PUBLIC_DNS to when (port) {
                 53 -> 53
@@ -229,12 +228,7 @@ class Socks5Server(
                     try { ch.disconnect() } catch (_: Exception) {}
                 } catch (e: Exception) {
                     val msg = e.message ?: ""
-                    // Brief pause; longer after channel-not-opened
-                    val delay = if (msg.contains("channel is not opened", true)) {
-                        200L * (attempt + 1)
-                    } else {
-                        80L * (attempt + 1)
-                    }
+                    val delay = if (msg.contains("channel is not opened", true)) 200L * (attempt + 1) else 80L * (attempt + 1)
                     try { Thread.sleep(delay) } catch (_: InterruptedException) { return null }
                 }
             }
@@ -259,7 +253,7 @@ class Socks5Server(
         out.flush()
     }
 
-    private fun pump(src: InputStream, dst: OutputStream) {
+    private fun pump(src: InputStream, dst: OutputStream, counter: AtomicLong) {
         val buf = ByteArray(32 * 1024)
         try {
             while (true) {
@@ -267,6 +261,7 @@ class Socks5Server(
                 if (n < 0) break
                 dst.write(buf, 0, n)
                 dst.flush()
+                if (n > 0) counter.addAndGet(n.toLong())
             }
         } catch (_: Exception) {
         }
