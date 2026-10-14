@@ -8,6 +8,7 @@ import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -16,25 +17,26 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * SOCKS5 on 127.0.0.1 — CONNECT via SSH direct-tcpip.
- * Tuned for throughput (opens<=10) while counting bytes for Stats.
+ * Host-level fail backoff avoids burning slots on blocked destinations.
  */
 class Socks5Server(
     private val sessionProvider: () -> Session?,
-    maxChannels: Int = 48,
+    maxChannels: Int = 32,
     private val udpgw: UdpgwClient? = null,
 ) {
 
     companion object {
-        private const val FAIL_LOG_INTERVAL_MS = 6_000L
-        /** Parallel channel opens — 4 was too low and felt like a UI regression. */
-        private const val MAX_OPENS_IN_FLIGHT = 10
+        private const val FAIL_LOG_INTERVAL_MS = 8_000L
+        private const val MAX_OPENS_IN_FLIGHT = 8
         private const val PUBLIC_DNS = "1.1.1.1"
         private const val DATA_IDLE_TIMEOUT_MS = 120_000
         private const val BUF = 64 * 1024
+        /** After channel-not-opened, skip this host for a while. */
+        private const val HOST_BACKOFF_MS = 25_000L
     }
 
-    private val limit = maxChannels.coerceIn(8, 96)
-    private val poolSize = (limit + 12).coerceIn(16, 64)
+    private val limit = maxChannels.coerceIn(8, 64)
+    private val poolSize = (limit + 8).coerceIn(16, 48)
     private val pool = Executors.newFixedThreadPool(poolSize)
     private val gate = Semaphore(limit)
     private val openGate = Semaphore(MAX_OPENS_IN_FLIGHT)
@@ -43,6 +45,7 @@ class Socks5Server(
     private val active = AtomicInteger(0)
     private val failCount = AtomicInteger(0)
     private val okCount = AtomicInteger(0)
+    private val hostFailUntil = ConcurrentHashMap<String, Long>()
     @Volatile private var lastFailLog = 0L
 
     @Volatile
@@ -54,13 +57,13 @@ class Socks5Server(
         val s = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
-        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT (speed mode)")
+        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT (balanced)")
         pool.execute {
             while (running) {
                 try {
                     val c = s.accept()
                     c.tcpNoDelay = true
-                    if (!gate.tryAcquire(5, TimeUnit.SECONDS)) {
+                    if (!gate.tryAcquire(4, TimeUnit.SECONDS)) {
                         try { c.close() } catch (_: Exception) {}
                         continue
                     }
@@ -83,13 +86,14 @@ class Socks5Server(
         try { server?.close() } catch (_: Exception) {}
         pool.shutdownNow()
         try { pool.awaitTermination(2, TimeUnit.SECONDS) } catch (_: Exception) {}
+        hostFailUntil.clear()
     }
 
     private fun handle(client: Socket) {
         var channel: ChannelDirectTCPIP? = null
         var counted = false
         try {
-            client.soTimeout = 20_000
+            client.soTimeout = 18_000
             val cin = DataInputStream(client.getInputStream())
             val cout = client.getOutputStream()
 
@@ -127,6 +131,12 @@ class Socks5Server(
                 return
             }
 
+            val until = hostFailUntil[host]
+            if (until != null && System.currentTimeMillis() < until) {
+                reply(cout, 5)
+                return
+            }
+
             val session = sessionProvider()
             if (session == null || !session.isConnected) {
                 reply(cout, 1)
@@ -135,17 +145,19 @@ class Socks5Server(
 
             val ch = openDirectChannel(session, host, port)
             if (ch == null) {
+                hostFailUntil[host] = System.currentTimeMillis() + HOST_BACKOFF_MS
                 logFail(host, port, "channel is not opened")
                 reply(cout, 5)
                 return
             }
             channel = ch
+            hostFailUntil.remove(host)
 
             reply(cout, 0)
             counted = true
             active.incrementAndGet()
             val n = okCount.incrementAndGet()
-            if (n <= 3 || n % 80 == 0) {
+            if (n <= 3 || n % 100 == 0) {
                 LogStore.append("SOCKS ok $host:$port active=${active.get()}/$limit")
             }
 
@@ -211,9 +223,9 @@ class Socks5Server(
     }
 
     private fun openDirectChannel(session: Session, host: String, port: Int): ChannelDirectTCPIP? {
-        if (!openGate.tryAcquire(8, TimeUnit.SECONDS)) return null
+        if (!openGate.tryAcquire(6, TimeUnit.SECONDS)) return null
         try {
-            repeat(3) { attempt ->
+            repeat(2) { attempt ->
                 if (!session.isConnected) return null
                 try {
                     val ch = synchronized(openLock) {
@@ -224,13 +236,11 @@ class Socks5Server(
                         c.setOrgPort(0)
                         c
                     }
-                    ch.connect(15_000)
+                    ch.connect(12_000)
                     if (ch.isConnected) return ch
                     try { ch.disconnect() } catch (_: Exception) {}
-                } catch (e: Exception) {
-                    val msg = e.message ?: ""
-                    val delay = if (msg.contains("channel is not opened", true)) 120L * (attempt + 1) else 40L * (attempt + 1)
-                    try { Thread.sleep(delay) } catch (_: InterruptedException) { return null }
+                } catch (_: Exception) {
+                    try { Thread.sleep(60L * (attempt + 1)) } catch (_: InterruptedException) { return null }
                 }
             }
             return null
@@ -254,7 +264,6 @@ class Socks5Server(
         out.flush()
     }
 
-    /** Stream copy with less frequent flush for better throughput. */
     private fun pump(src: InputStream, dst: OutputStream, counter: AtomicLong) {
         val buf = ByteArray(BUF)
         var pending = 0
