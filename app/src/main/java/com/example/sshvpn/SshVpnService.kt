@@ -31,7 +31,7 @@ class SshVpnService : VpnService() {
         const val EXTRA_CONFIG = "config"
         private const val CHANNEL_ID = "karoon_vpn"
         private const val NOTIF_ID = 1
-        private const val MTU = 1280
+        private const val MTU = 1200
         private const val SSH_CONNECT_ATTEMPTS = 3
         private const val MAX_RECONNECT_ROUNDS = 8
     }
@@ -140,8 +140,9 @@ class SshVpnService : VpnService() {
             if (stopping || userStop.get()) return true
             session = s
             LogStore.append("SSH session established")
+            protectSession(s)
 
-            val channels = cfg.maxChannels.coerceIn(8, 64)
+            val channels = cfg.maxChannels.coerceIn(8, 48)
 
             stage = "Starting local SOCKS5 proxy"
             VpnState.update(statusLabel, "Starting local proxy ...")
@@ -172,6 +173,7 @@ class SshVpnService : VpnService() {
                 ?: throw IllegalStateException("VPN permission denied or another VPN is active")
             tun = pfd
             LogStore.append("VPN interface established (MTU=$MTU)")
+            protectSession(s)
 
             stage = "Starting traffic tunnel (hev-socks5-tunnel)"
             VpnState.update(statusLabel, "Starting traffic tunnel ...")
@@ -191,9 +193,8 @@ class SshVpnService : VpnService() {
                   udp: 'tcp'
                 misc:
                   task-stack-size: 86016
-                  connect-timeout: 12000
-                  tcp-read-write-timeout: 180000
-                  udp-read-write-timeout: 30000
+                  connect-timeout: 15000
+                  read-write-timeout: 300000
                   log-level: warn
                 """.trimIndent() + "\n"
             )
@@ -202,6 +203,7 @@ class SshVpnService : VpnService() {
                 throw IllegalStateException("Failed to start hev-socks5-tunnel")
             }
             LogStore.append("Tunnel started successfully")
+            probeThroughSocks(server.port)
 
             VpnState.update(Status.CONNECTED, "Connected to ${cfg.host}")
             updateNotification("Connected to ${cfg.host}")
@@ -297,6 +299,62 @@ class SshVpnService : VpnService() {
             networkCallback?.let { cm.unregisterNetworkCallback(it) }
         } catch (_: Exception) {}
         networkCallback = null
+    }
+
+    /** Keep the SSH TCP socket off the VPN interface (prevents black-hole / near-zero download). */
+    private fun protectSession(session: Session) {
+        try {
+            for (name in listOf("socket", "sock")) {
+                try {
+                    val f = session.javaClass.getDeclaredField(name)
+                    f.isAccessible = true
+                    when (val v = f.get(session)) {
+                        is java.net.Socket -> {
+                            val ok = protect(v)
+                            LogStore.append("SSH protect(socket)=$ok local=${v.localPort}")
+                            return
+                        }
+                    }
+                } catch (_: Exception) {
+                }
+            }
+            try {
+                val m = session.javaClass.methods.firstOrNull { it.name == "getSocket" && it.parameterCount == 0 }
+                val sock = m?.invoke(session) as? java.net.Socket
+                if (sock != null) {
+                    LogStore.append("SSH protect(getSocket)=${protect(sock)}")
+                    return
+                }
+            } catch (_: Exception) {
+            }
+            LogStore.append("SSH protect: socket field not found (disallow-app only)")
+        } catch (e: Exception) {
+            LogStore.append("SSH protect error: ${e.message}")
+        }
+    }
+
+    /** Quick HTTPS fetch via local SOCKS to verify download path. */
+    private fun probeThroughSocks(socksPort: Int) {
+        Thread {
+            try {
+                val proxy = java.net.Proxy(
+                    java.net.Proxy.Type.SOCKS,
+                    java.net.InetSocketAddress("127.0.0.1", socksPort),
+                )
+                val url = java.net.URL("https://www.cloudflare.com/cdn-cgi/trace")
+                val conn = url.openConnection(proxy) as java.net.HttpURLConnection
+                conn.connectTimeout = 12000
+                conn.readTimeout = 12000
+                conn.instanceFollowRedirects = false
+                conn.connect()
+                val code = conn.responseCode
+                val n = try { conn.inputStream.readBytes().size } catch (_: Exception) { 0 }
+                conn.disconnect()
+                LogStore.append("Probe via SOCKS: HTTP $code bytes=$n")
+            } catch (e: Exception) {
+                LogStore.append("Probe via SOCKS failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.also { it.isDaemon = true; it.start() }
     }
 
     private fun connectSshWithRetry(cfg: SshConfig): Session {
