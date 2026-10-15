@@ -42,6 +42,7 @@ class Socks5Server(
     private val openLock = Any()
     private var server: ServerSocket? = null
     private val active = AtomicInteger(0)
+    private val connectionIds = AtomicInteger(0)
     private val failCount = AtomicInteger(0)
     private val okCount = AtomicInteger(0)
     private val hostFailUntil = ConcurrentHashMap<String, Long>()
@@ -151,6 +152,11 @@ class Socks5Server(
             }
             channel = ch
             hostFailUntil.remove(host)
+            val connectionId = connectionIds.incrementAndGet()
+            val uplinkBytes = AtomicLong(0)
+            val downlinkBytes = AtomicLong(0)
+            val startedAt = System.currentTimeMillis()
+            LogStore.append("SOCKS[$connectionId] channel connected $host:$port")
 
             reply(cout, 0)
             counted = true
@@ -164,10 +170,14 @@ class Socks5Server(
 
             val rin = ch.inputStream
             val rout = ch.outputStream
-            val t = Thread { pump(rin, cout, TunnelStats.downlink) }.also { it.isDaemon = true; it.start() }
-            pump(cin, rout, TunnelStats.uplink)
+            val t = Thread {
+                pump(rin, cout, TunnelStats.downlink, downlinkBytes, "SOCKS[${connectionIds.get()}] SSH->client")
+            }.also { it.isDaemon = true; it.start() }
+            pump(cin, rout, TunnelStats.uplink, uplinkBytes, "SOCKS[$connectionId] client->SSH")
             t.join(2_000)
-        } catch (_: Exception) {
+            LogStore.append("SOCKS[$connectionId] finished ${host}:$port up=${uplinkBytes.get()}B down=${downlinkBytes.get()}B age=${System.currentTimeMillis() - startedAt}ms")
+        } catch (e: Exception) {
+            LogStore.append("SOCKS handler error ${e.javaClass.simpleName}: ${e.message}")
         } finally {
             if (counted) active.decrementAndGet()
             try { channel?.disconnect() } catch (_: Exception) {}
@@ -264,23 +274,36 @@ class Socks5Server(
         out.flush()
     }
 
-    private fun pump(src: InputStream, dst: OutputStream, counter: AtomicLong) {
+    private fun pump(
+        src: InputStream,
+        dst: OutputStream,
+        counter: AtomicLong,
+        connectionCounter: AtomicLong,
+        label: String,
+    ) {
         val buf = ByteArray(BUF)
         var pending = 0
         try {
             while (true) {
                 val n = src.read(buf)
-                if (n < 0) break
+                if (n < 0) {
+                    LogStore.append("$label EOF after ${connectionCounter.get()}B")
+                    break
+                }
                 dst.write(buf, 0, n)
                 pending += n
-                if (n > 0) counter.addAndGet(n.toLong())
+                if (n > 0) {
+                    counter.addAndGet(n.toLong())
+                    connectionCounter.addAndGet(n.toLong())
+                }
                 if (pending >= BUF) {
                     dst.flush()
                     pending = 0
                 }
             }
             if (pending > 0) dst.flush()
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            LogStore.append("$label stopped after ${connectionCounter.get()}B: ${e.javaClass.simpleName}: ${e.message ?: "no message"}")
         }
     }
 }
