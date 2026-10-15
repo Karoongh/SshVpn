@@ -16,6 +16,13 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Restore documented signing keystore
+        run: |
+          set -e
+          test -f keystore/karoon-debug.jks.base64
+          base64 -d keystore/karoon-debug.jks.base64 > keystore/karoon-debug.jks
+          test -s keystore/karoon-debug.jks
+
       - name: Fetch complete hev-socks5-tunnel (with submodules)
         run: |
           set -e
