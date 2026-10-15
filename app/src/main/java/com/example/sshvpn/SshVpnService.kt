@@ -160,8 +160,8 @@ class SshVpnService : VpnService() {
                 .setMtu(MTU)
                 .addAddress("198.18.0.1", 30)
                 .addRoute("0.0.0.0", 0)
-                .addDnsServer("1.1.1.1")
-                .addDnsServer("8.8.8.8")
+                // Use hev mapdns so synthetic DNS addresses are mapped back to hostnames.
+                .addDnsServer("198.18.0.2")
 
             try { builder.allowFamily(OsConstants.AF_INET) } catch (_: Exception) {}
             if (Build.VERSION.SDK_INT >= 29) {
@@ -187,6 +187,12 @@ class SshVpnService : VpnService() {
                 tunnel:
                   mtu: $MTU
                   ipv4: 198.18.0.1
+                mapdns:
+                  address: 198.18.0.2
+                  port: 53
+                  network: 198.18.0.0
+                  netmask: 255.254.0.0
+                  cache-size: 10000
                 socks5:
                   port: ${server.port}
                   address: 127.0.0.1
