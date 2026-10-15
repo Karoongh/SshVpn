@@ -27,7 +27,7 @@ class Socks5Server(
 
     companion object {
         private const val FAIL_LOG_INTERVAL_MS = 8_000L
-        private const val MAX_OPENS_IN_FLIGHT = 16
+        private const val MAX_OPENS_IN_FLIGHT = 10
         private const val DATA_IDLE_TIMEOUT_MS = 180_000
         private const val BUF = 64 * 1024
         private const val HOST_BACKOFF_MS = 20_000L
@@ -56,7 +56,7 @@ class Socks5Server(
         val s = ServerSocket(0, 512, InetAddress.getByName("127.0.0.1"))
         server = s
         running = true
-        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT (npv-parity)")
+        LogStore.append("SOCKS limit=$limit opens<=$MAX_OPENS_IN_FLIGHT (stable mode)")
         pool.execute {
             while (running) {
                 try {
@@ -218,7 +218,7 @@ class Socks5Server(
     private fun openDirectChannel(session: Session, host: String, port: Int): ChannelDirectTCPIP? {
         if (!openGate.tryAcquire(8, TimeUnit.SECONDS)) return null
         try {
-            repeat(2) { attempt ->
+            repeat(3) { attempt ->
                 if (!session.isConnected) return null
                 try {
                     // Only openChannel needs the session lock; connect runs outside.
@@ -230,7 +230,7 @@ class Socks5Server(
                         c.setOrgPort(0)
                         c
                     }
-                    ch.connect(10_000)
+                    ch.connect(15_000)
                     if (ch.isConnected) return ch
                     try { ch.disconnect() } catch (_: Exception) {}
                 } catch (_: Exception) {
