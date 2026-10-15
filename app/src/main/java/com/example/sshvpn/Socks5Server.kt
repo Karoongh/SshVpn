@@ -171,7 +171,7 @@ class Socks5Server(
             val rin = ch.inputStream
             val rout = ch.outputStream
             val t = Thread {
-                pump(rin, cout, TunnelStats.downlink, downlinkBytes, "SOCKS[${connectionIds.get()}] SSH->client")
+                pump(rin, cout, TunnelStats.downlink, downlinkBytes, "SOCKS[$connectionId] SSH->client")
             }.also { it.isDaemon = true; it.start() }
             pump(cin, rout, TunnelStats.uplink, uplinkBytes, "SOCKS[$connectionId] client->SSH")
             t.join(2_000)
