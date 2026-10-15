@@ -16,6 +16,24 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      - name: Fetch complete hev-socks5-tunnel (with submodules)
+        run: |
+          set -e
+          JNI_DIR="app/src/main/jni"
+          rm -rf "$JNI_DIR/hev-socks5-tunnel"
+          git clone --depth 1 --recursive https://github.com/heiher/hev-socks5-tunnel.git "$JNI_DIR/hev-socks5-tunnel"
+          printf '%s\n' \
+            'APP_OPTIM := release' \
+            'APP_PLATFORM := android-26' \
+            'APP_ABI := armeabi-v7a arm64-v8a x86 x86_64' \
+            'APP_CFLAGS := -O3 -DANDROID' \
+            'APP_SUPPORT_FLEXIBLE_PAGE_SIZES := true' \
+            > "$JNI_DIR/Application.mk"
+          printf '%s\n' 'include $(call all-subdir-makefiles)' > "$JNI_DIR/Android.mk"
+          test -f "$JNI_DIR/hev-socks5-tunnel/src/hev-jni.c"
+          test -f "$JNI_DIR/hev-socks5-tunnel/src/hev-main.c"
+          test -f "$JNI_DIR/hev-socks5-tunnel/src/misc/hev-utils.h"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
