@@ -266,7 +266,6 @@ class Socks5Server(
         label: String,
     ) {
         val buf = ByteArray(BUF)
-        var pending = 0
         try {
             while (true) {
                 val n = src.read(buf)
@@ -274,18 +273,15 @@ class Socks5Server(
                     LogStore.append("$label EOF after ${connectionCounter.get()}B")
                     break
                 }
+                if (n == 0) continue
                 dst.write(buf, 0, n)
-                pending += n
-                if (n > 0) {
-                    counter.addAndGet(n.toLong())
-                    connectionCounter.addAndGet(n.toLong())
-                }
-                if (pending >= BUF) {
-                    dst.flush()
-                    pending = 0
-                }
+                // Flush every read: JSch's channel output may buffer small writes.
+                // Waiting for 64 KiB can deadlock TLS handshakes, whose ClientHello
+                // is usually only a few KiB and waits for the server response.
+                dst.flush()
+                counter.addAndGet(n.toLong())
+                connectionCounter.addAndGet(n.toLong())
             }
-            if (pending > 0) dst.flush()
         } catch (e: Exception) {
             LogStore.append("$label stopped after ${connectionCounter.get()}B: ${e.javaClass.simpleName}: ${e.message ?: "no message"}")
         }
