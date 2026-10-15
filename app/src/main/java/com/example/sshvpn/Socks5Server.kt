@@ -28,7 +28,6 @@ class Socks5Server(
     companion object {
         private const val FAIL_LOG_INTERVAL_MS = 8_000L
         private const val MAX_OPENS_IN_FLIGHT = 16
-        private const val PUBLIC_DNS = "1.1.1.1"
         private const val DATA_IDLE_TIMEOUT_MS = 180_000
         private const val BUF = 64 * 1024
         private const val HOST_BACKOFF_MS = 20_000L
@@ -122,10 +121,6 @@ class Socks5Server(
             var host: String = readHost(cin, atyp) ?: return
             var port = cin.readUnsignedShort()
 
-            val rewritten = rewriteDestination(host, port)
-            host = rewritten.first
-            port = rewritten.second
-
             if (shouldReject(host)) {
                 reply(cout, 5)
                 return
@@ -213,17 +208,6 @@ class Socks5Server(
             InetAddress.getByAddress(b).hostAddress
         }
         else -> null
-    }
-
-    private fun rewriteDestination(host: String, port: Int): Pair<String, Int> {
-        if (host.startsWith("198.18.") || host.startsWith("10.10.34.")) {
-            return PUBLIC_DNS to when (port) {
-                53 -> 53
-                853, 443, 784, 8853 -> 853
-                else -> 53
-            }
-        }
-        return host to port
     }
 
     private fun shouldReject(host: String): Boolean {
