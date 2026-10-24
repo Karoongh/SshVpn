@@ -1,41 +1,54 @@
 # Agent Instructions — Karoon Tunnel
 
 ## Project purpose
-Karoon Tunnel is an Android SSH-based VPN client. Its intended traffic path is:
-Android apps → Android `VpnService` TUN interface → `hev-socks5-tunnel` → local SOCKS5 → SSH `direct-tcpip` forwarding → remote network.
+Karoon Tunnel is an Android SSH-based VPN client. Intended traffic path:
+Android apps → Android `VpnService` TUN → `hev-socks5-tunnel` → local SOCKS5 → SSH `direct-tcpip` forwarding → remote network.
 
-## Mandatory workflow for every agent
-1. Read this file and `README.md` first. Read `docs/BUILD_AND_SIGNING.md` before changing build, package, signing, or installation configuration.
-2. Inspect the existing implementation and Git history relevant to the task before editing. Do not assume unrecorded project history.
-3. Make the smallest change that solves the verified problem. Avoid duplicate implementations, unnecessary files, broad refactors, and unrelated UI changes.
-4. Never overwrite, regenerate, or commit a signing keystore, private key, password, token, or real VPN credentials. Do not request secrets in chat. Use local environment variables or ignored local properties for signing.
-5. Do not change `applicationId` merely to bypass a signing mismatch. That creates a separate app installation and can strand existing app data. Explain the migration trade-off and get explicit approval before changing it.
-6. Do not advise uninstalling the installed app until the user understands that its local app data may be erased and a same-certificate update has been ruled out.
-7. Preserve native source dependencies and their licensing notices. Avoid editing vendored third-party code unless the bug is demonstrably there.
-8. Validate changes with the Gradle wrapper and report the exact commands, results, and any checks that could not be run. Never claim a successful build without actual build output.
+This is also a public portfolio repository. Keep its history, documentation, build reproducibility, licensing, security posture, and claims suitable for technical review.
+
+## Mandatory workflow
+1. Read this file and `README.md` first. Read `docs/BUILD_AND_SIGNING.md` before changing build, package, or signing configuration.
+2. Inspect current source and recent Git history before editing. Treat source code and verified CI results as authoritative; do not assume prior summaries describe the latest state.
+3. Make focused changes. Avoid broad refactors and unrelated changes unless required for security or compatibility.
+4. Never commit signing keystores, private keys, passwords, tokens, real VPN credentials, or exported user profiles. Never print secrets in logs.
+5. A signing keystore was previously committed publicly as Base64. It has been removed from the current branch but remains in Git history; treat it as compromised. Do not restore or reuse it. If Google Play distribution is involved, determine the key's role and follow the supported upload-key reset procedure where applicable.
+6. Do not change `applicationId` to bypass an update/signature issue. This creates a separate app identity and can strand app data. Explain trade-offs and obtain explicit approval before changing it.
+7. Do not advise uninstalling the installed app without explaining possible loss of local data and checking whether a same-certificate update is possible.
+8. Preserve native dependencies and their license notices. Do not edit vendored third-party code unless the defect is demonstrably there.
+9. Validate with the Gradle wrapper and report exact commands/results. Never claim a build, test, security audit, or Play approval without evidence.
+10. Keep README and docs aligned with the actual source, configuration, limitations, and current CI workflow.
 
 ## Build baseline
-- Android Gradle Plugin: 8.5.2
+- Android Gradle Plugin: 8.9.1
+- Gradle wrapper: 8.11.1
 - Kotlin Gradle Plugin: 1.9.24
-- Gradle wrapper distribution: 8.7
 - Java/Kotlin target: 17
-- Compile SDK: 34
+- compileSdk / targetSdk: 36
+- minSdk: 26
 - NDK: 26.1.10909125
+- CMake: 3.22.1
+- Application ID: `com.example.sshvpn`
 - Native build: `app/src/main/jni/Android.mk`
-- Module: `:app`
-- Current namespace/application ID: `com.example.sshvpn`
-- Release build currently uses the Gradle debug signing configuration. This is suitable only for local testing, not a stable release identity across machines.
+- Release signing is configured only through local environment variables; never hardcode signing credentials.
 
 ## Required validation
-At minimum, when the environment permits:
+When the environment permits, run:
 - `./gradlew :app:assembleDebug` (Windows: `gradlew.bat :app:assembleDebug`)
-- `./gradlew :app:assembleRelease` (Windows: `gradlew.bat :app:assembleRelease`)
-- Verify APK signing with Android SDK `apksigner verify --verbose --print-certs <apk>`.
-- Compare the new APK certificate SHA-256 with the installed app's signer before attempting an in-place update.
-- Report native build, packaging, and signing failures separately.
+- `./gradlew :app:assembleRelease`
+- `./gradlew :app:lintDebug`
+- `apksigner verify --verbose --print-certs <apk>`
 
-## Known constraints and security concerns
-- The reported installation error says the APK signer does not match the installed app. This is an Android package-signature/update constraint; by itself it does not prove a source-code compilation defect.
-- README currently documents that host-key checking is disabled, stored connection details are not separately encrypted, IPv6 is not tunneled, and non-DNS UDP is not forwarded. Do not silently represent these as solved.
-- Treat user-provided APK hashes as file hashes unless explicitly identified as certificate fingerprints. An APK SHA-256 is not the signing certificate SHA-256.
-- Keep documentation concise and update it when verified architecture, commands, build settings, or limitations change.
+Also review:
+- CI result and artifact for the exact commit.
+- Android merged manifest and foreground-service declarations.
+- Real-device VPN connection, DNS, routing, permission denial/revocation, network changes, and disconnect behavior.
+- Release signer certificate, privacy policy, Data safety declaration, VPN disclosure/consent, and Google Play policies.
+
+## Known constraints and security requirements
+- Do not disable SSH host-key verification in production. Implement verified host-key pinning or a safe first-use trust flow.
+- Review protection and encryption of stored profiles and credentials.
+- Current routing is IPv4-focused; IPv6 and general UDP are not fully supported. Do not claim full-device coverage for unsupported traffic.
+- The UI may expose protocol choices that are not all implemented; document actual behavior and avoid presenting placeholders as working features.
+- Google Play target API compliance alone does not establish policy compliance. VPN apps must meet the applicable VPN, privacy, data safety, disclosure, consent, and encryption requirements.
+- Keep dependencies and native code licenses discoverable.
+- Distinguish source-level changes, CI build success, real-device validation, security review, and Play approval as separate statuses.
