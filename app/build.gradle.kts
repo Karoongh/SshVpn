@@ -46,12 +46,8 @@ android {
             // Use the machine-local Android debug key; never commit signing keys.
         }
         release {
-            isMinifyEnabled = true
-            isShrinkResources = true
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
+            // Keep release code unminified until native/JSch shrinker rules are validated.
+            isMinifyEnabled = false
             // Without release credentials, Gradle produces an unsigned release APK.
             if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
         }
