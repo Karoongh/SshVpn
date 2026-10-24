@@ -16,13 +16,6 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Restore documented signing keystore
-        run: |
-          set -e
-          test -f keystore/karoon-debug.jks.base64
-          base64 -d keystore/karoon-debug.jks.base64 > keystore/karoon-debug.jks
-          test -s keystore/karoon-debug.jks
-
       - name: Fetch complete hev-socks5-tunnel (with submodules)
         run: |
           set -e
@@ -53,21 +46,21 @@ jobs:
           packages: ''
 
       - name: Install native build tools
-        run: sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
 
       - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.7
+          gradle-version: 8.11.1
 
       - name: Build debug APK
-        run: gradle --no-daemon :app:assembleDebug
+        run: gradle --no-daemon :app:assembleDebug :app:assembleRelease :app:lintDebug
 
       - name: Verify APK signature
         run: |
           APK="app/build/outputs/apk/debug/app-debug.apk"
           test -f "$APK"
-          "$ANDROID_HOME/build-tools/34.0.0/apksigner" verify --verbose --print-certs "$APK"
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs "$APK"
 
       - name: Upload debug APK
         uses: actions/upload-artifact@v4
