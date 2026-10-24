@@ -3,48 +3,57 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val releaseStoreFile = providers.environmentVariable("ANDROID_RELEASE_STORE_FILE").orNull
+val releaseStorePassword = providers.environmentVariable("ANDROID_RELEASE_STORE_PASSWORD").orNull
+val releaseKeyAlias = providers.environmentVariable("ANDROID_RELEASE_KEY_ALIAS").orNull
+val releaseKeyPassword = providers.environmentVariable("ANDROID_RELEASE_KEY_PASSWORD").orNull
+val hasReleaseSigning = listOf(
+    releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword
+).all { !it.isNullOrBlank() }
+
 android {
     namespace = "com.example.sshvpn"
-    compileSdk = 34
+    compileSdk = 36
     ndkVersion = "26.1.10909125"
 
     defaultConfig {
         applicationId = "com.example.sshvpn"
         minSdk = 26
-        targetSdk = 34
-        versionCode = 2
-        versionName = "1.3"
+        targetSdk = 36
+        versionCode = 3
+        versionName = "1.4"
 
-        ndk {
-            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
-        }
+        ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64") }
     }
 
-    // Fixed key so every CI build can update over the previous install.
-    // Credentials documented in keystore/SIGNING.md
-    signingConfigs {
-        create("karoon") {
-            val ks = rootProject.file("keystore/karoon-debug.jks")
-            storeFile = ks
-            storePassword = "karoon_tunnel_debug"
-            keyAlias = "karoon"
-            keyPassword = "karoon_tunnel_debug"
+    if (hasReleaseSigning) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(releaseStoreFile!!)
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
         }
     }
 
     externalNativeBuild {
-        ndkBuild {
-            path = file("src/main/jni/Android.mk")
-        }
+        ndkBuild { path = file("src/main/jni/Android.mk") }
     }
 
     buildTypes {
         debug {
-            signingConfig = signingConfigs.getByName("karoon")
+            // Use the machine-local Android debug key; never commit signing keys.
         }
         release {
-            isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("karoon")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            // Without release credentials, Gradle produces an unsigned release APK.
+            if (hasReleaseSigning) signingConfig = signingConfigs.getByName("release")
         }
     }
 
@@ -52,9 +61,7 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions {
-        jvmTarget = "17"
-    }
+    kotlinOptions { jvmTarget = "17" }
 }
 
 dependencies {
