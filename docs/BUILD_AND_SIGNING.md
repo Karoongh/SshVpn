@@ -1,71 +1,109 @@
-# Build, install, and signing notes
+# Build, install, and signing
 
-## Current project baseline
-The Android module is `:app`. Build configuration observed on the default branch:
-- Android Gradle Plugin 8.5.2
-- Kotlin Gradle Plugin 1.9.24
-- Gradle 8.7 wrapper
-- JDK target 17
-- compileSdk 34
-- NDK 26.1.10909125
-- Native build file: `app/src/main/jni/Android.mk`
+## Current build baseline
+
+- Android Gradle Plugin: 8.9.1
+- Gradle wrapper: 8.11.1
+- Kotlin Gradle Plugin: 1.9.24
+- JDK target: 17
+- compileSdk / targetSdk: 36
+- minSdk: 26
+- NDK: 26.1.10909125
+- CMake: 3.22.1
 - Application ID: `com.example.sshvpn`
 
-Install the matching NDK and CMake tools in Android Studio's SDK Manager. Keep the native dependency directories described in README present.
+Install Android SDK Platform 36, Build Tools 36.0.0, the NDK version above, and CMake through Android Studio's SDK Manager.
 
-## Build APKs
+## Build
 
 From the repository root:
 
-Windows PowerShell / CMD:
+Windows:
 ```bat
 gradlew.bat :app:assembleDebug
 gradlew.bat :app:assembleRelease
+gradlew.bat :app:lintDebug
 ```
 
-macOS / Linux:
+macOS/Linux:
 ```sh
 ./gradlew :app:assembleDebug
 ./gradlew :app:assembleRelease
+./gradlew :app:lintDebug
 ```
 
-Expected outputs:
+Expected APK paths:
+
 - Debug: `app/build/outputs/apk/debug/app-debug.apk`
-- Release: `app/build/outputs/apk/release/app-release.apk`
+- Release: `app/build/outputs/apk/release/app-release-unsigned.apk` when no release signing variables are provided (the exact filename can vary by AGP task output).
 
-The release build is currently configured to use the debug signing key. This is not a production signing setup and can yield different signing identities on different computers, because each computer may have a different debug keystore.
+The CI workflow fetches the upstream `hev-socks5-tunnel` source with submodules before compiling native code. A local build must have that source tree available under `app/src/main/jni/hev-socks5-tunnel/`.
 
-## Why the phone reports “Package signature does not match the installed app”
+## Signing configuration
 
-Android allows an installed app to be updated only when the application ID matches and the new APK is signed by the same certificate (or a valid signing-key rotation lineage exists). The screenshot supplied on 2026-10-12 reports a certificate mismatch for the app labelled “Karoon Tunnel”.
+Debug builds use the machine-local Android debug key. Do not commit a debug keystore or rely on matching debug certificates between computers.
 
-The supplied SHA-256 `bea0bece75da7f8fa0d0846b01b644c8a4f7fd2026a1668d2270c7692887e575` is described by the user as the software hash. Unless it was generated from the APK signing certificate, it is a hash of the APK file and cannot be compared directly with the certificate fingerprint.
+Release signing is enabled only when all of these environment variables are set:
 
-### Diagnose before removing the installed app
-1. Locate the exact APK being installed and confirm its file hash:
-   `certutil -hashfile app-debug.apk SHA256` (Windows)
-   or `sha256sum app-debug.apk` (macOS/Linux).
-2. Print the APK signer certificate:
-   `apksigner verify --verbose --print-certs app-debug.apk`
-3. Obtain the signer certificate fingerprint for the installed app. If Android SDK tools and USB debugging are available, use `adb shell pm path com.example.sshvpn` to locate its installed APK, pull it with `adb pull <device-path> installed.apk`, then run `apksigner verify --print-certs installed.apk`. Some devices/Android versions may restrict pulling the package; if so, use a trusted APK/signing inspection tool or the original APK that was installed.
-4. Compare the **signer certificate SHA-256**, not the APK file hash. If they differ, an in-place update will be rejected.
+- `ANDROID_RELEASE_STORE_FILE`: path to the local release keystore
+- `ANDROID_RELEASE_STORE_PASSWORD`
+- `ANDROID_RELEASE_KEY_ALIAS`
+- `ANDROID_RELEASE_KEY_PASSWORD`
 
-### Choose the appropriate remedy
-- **Preferred, preserve app data:** build/sign the new APK with the same private signing key as the installed app. The private key must be available from the original build environment or backup. Do not upload or commit it.
-- **If the old signing key is unavailable:** Android cannot accept this APK as an in-place update under the same application ID. Back up/export any important configuration first. Only after confirming the user accepts loss of local app data, uninstall the existing app for all Android users/PrivateSpace profiles and install the new APK.
-- **Separate installation:** changing `applicationId` can permit installation as a separate app, but does not update the old app or transfer its private data. Do not make this change just to hide the signature problem without explicit approval.
+Keep the keystore and passwords outside Git. Configure them in a trusted local environment or protected CI secrets. Do not print secrets in build logs. The repository intentionally does not contain release signing credentials.
 
-## Stable release signing (not configured yet)
-For a release that must update consistently across devices/build machines, use a dedicated, backed-up keystore and keep it outside version control. Configure the release signing config to read the keystore path, alias, and passwords from local environment variables or an ignored local properties file. Never commit the keystore or credentials. Record the public certificate SHA-256 fingerprint in secure project/release documentation; the fingerprint is not a private key.
+Example (PowerShell; replace values locally and do not paste real secrets into source files):
+```powershell
+$env:ANDROID_RELEASE_STORE_FILE = "C:\secure\karoon-upload-key.jks"
+$env:ANDROID_RELEASE_STORE_PASSWORD = "<set-locally>"
+$env:ANDROID_RELEASE_KEY_ALIAS = "<set-locally>"
+$env:ANDROID_RELEASE_KEY_PASSWORD = "<set-locally>"
+.\gradlew.bat :app:assembleRelease
+```
 
-Do not generate a new signing key and assume it will match an already-installed APK. A newly generated key only establishes a new signing identity.
+## Important signing-key exposure
 
-## Validation checklist
+A signing keystore was previously committed to this public repository as Base64 data and has now been removed from the current branch. **Removing a file from the latest commit does not remove it from Git history or revoke the key.** Treat that signing key as compromised.
+
+- If the app has not been published and this key was only used for local/debug builds, generate a new private key locally and keep it out of version control.
+- If the app is registered in Google Play, determine whether the exposed key is the upload key or the app-signing key. Follow Play Console's supported upload-key reset process where applicable. Do not casually replace an app-signing key: it can affect update continuity.
+- For any existing sideloaded installation, compare the signer certificate before updating. A different certificate will not update the installed package in place unless Android's supported signing lineage applies.
+- Never send the keystore or its passwords in chat, issue trackers, or public CI logs.
+
+## Verify the APK signature
+
+Use Android SDK Build Tools:
+
+```sh
+apksigner verify --verbose --print-certs app/build/outputs/apk/debug/app-debug.apk
+```
+
+To compare two APKs, compare the **signer certificate SHA-256 fingerprint** from `apksigner`, not the SHA-256 of the APK file itself. The APK file hash identifies the file; the signer fingerprint identifies the signing certificate.
+
+## Installation error: package signature mismatch
+
+Android normally permits an in-place update only when the package/application ID matches and the new APK has the same signing identity (or a valid supported signing-key rotation lineage).
+
+1. Confirm which APK is being installed and calculate its file hash:
+   - Windows: `certutil -hashfile app-debug.apk SHA256`
+   - macOS/Linux: `sha256sum app-debug.apk`
+2. Run `apksigner verify --verbose --print-certs app-debug.apk`.
+3. Obtain the signer fingerprint of the installed package using a trusted method or the original installed APK.
+4. Compare the certificate fingerprints. Do not compare an APK file hash to a signer fingerprint.
+5. Prefer rebuilding with the original trusted key if it is still safe and available. If the key has been exposed publicly, assess the compromise first.
+6. Uninstalling can erase app-local data. Export/back up important profiles before uninstalling and do not use uninstall as the default fix.
+
+## Release validation checklist
+
 - [ ] Gradle sync succeeds.
 - [ ] Debug build succeeds.
 - [ ] Release build succeeds.
-- [ ] APK signature verification succeeds.
-- [ ] Record APK file SHA-256 and signer certificate SHA-256 separately.
-- [ ] Compare signer certificate with the installed build before trying an update.
-- [ ] Install/update tested on a real device.
-- [ ] Do not report success for any unchecked item.
+- [ ] Android lint completes and findings are reviewed.
+- [ ] APK/AAB signature is verified.
+- [ ] Release is signed with a protected, intended key.
+- [ ] Signing fingerprint and artifact hash are recorded separately.
+- [ ] App is installed and tested on real devices.
+- [ ] VPN permission denial/revocation, network transitions, DNS, IPv4/IPv6, and disconnect behavior are tested.
+- [ ] Privacy policy, Play Console Data safety, VPN disclosure/consent, store listing, and current policy requirements are reviewed.
+
+Do not mark an unchecked item as passed. A successful CI build proves buildability only; it does not prove VPN correctness, security, or Google Play approval.
