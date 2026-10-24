@@ -1,0 +1,21 @@
+# Gradle / Android Studio
+.gradle/
+**/build/
+local.properties
+.idea/
+*.iml
+
+# Local signing material and credentials
+keystore/*.jks
+keystore/*.keystore
+keystore/*.p12
+keystore/*.pfx
+keystore/*.base64
+key.properties
+*.jks
+*.keystore
+
+# Local logs and generated files
+*.log
+.DS_Store
+Thumbs.db
